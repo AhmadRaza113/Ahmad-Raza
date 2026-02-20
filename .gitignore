@@ -3,3 +3,17 @@ node_modules/
 local.settings.json
 .env
 .DS_Store
+
+
+# Azurite (local emulator data)
+__blobstorage__/
+__queuestorage__/
+__tablestorage__/
+__azurite_db_*.json
+AzuriteConfig
+
+# Azure Functions local settings (contains secrets)
+local.settings.json
+
+# Node
+node_modules/
