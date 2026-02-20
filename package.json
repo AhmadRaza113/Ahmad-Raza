@@ -1,0 +1,17 @@
+{
+  "name": "auditor-grid-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "func start",
+    "test": "node -e \"console.log('ok')\""
+  },
+  "dependencies": {
+    "@azure/functions": "^4.6.0",
+    "mssql": "^11.0.1",
+    "uuid": "^10.0.0",
+    "redis": "^4.6.13"
+  },
+  "main": "src/functions/*.js"
+}

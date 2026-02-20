@@ -1,0 +1,5 @@
+.venv/
+node_modules/
+local.settings.json
+.env
+.DS_Store
