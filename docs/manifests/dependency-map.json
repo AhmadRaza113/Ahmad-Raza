@@ -1,0 +1,501 @@
+{
+  "schemaVersion": "1.1.0",
+  "description": "Impact-routing dependency map for AI changes. Uses current root paths as canonical.",
+  "status": "starter-updated",
+  "lastVerified": "2026-02-22",
+  "notes": [
+    "This is a context-routing map, not a strict import graph.",
+    "Read 'dependsOn' files before editing the target for safer changes."
+  ],
+  "paths": {
+    "index.html": {
+      "dependsOn": [
+        "sheet-grid.js",
+        "src/component.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/public-api.md",
+        "docs/integration/grid-portal-contract.md"
+      ],
+      "riskTags": [
+        "host-integration",
+        "public-api",
+        "signalr-sdk-loading"
+      ]
+    },
+    "sheet-grid.js": {
+      "dependsOn": [
+        "src/component.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/public-api.md",
+        "docs/grid/boot-sequence.md"
+      ],
+      "riskTags": [
+        "entrypoint",
+        "custom-element-registration"
+      ]
+    },
+    "src/component.js": {
+      "dependsOn": [
+        "src/state/persistence.js",
+        "src/api/client.js",
+        "src/live/connection.js",
+        "src/rendering/shell.js",
+        "src/rendering/grid.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/public-api.md",
+        "docs/grid/boot-sequence.md",
+        "docs/grid/module-map.md"
+      ],
+      "riskTags": [
+        "component-lifecycle",
+        "attribute-changes",
+        "boot-restart"
+      ]
+    },
+    "src/editing/inline-editor.js": {
+      "dependsOn": [
+        "src/actions/selection.js",
+        "src/interaction/mouse.js",
+        "src/interaction/keyboard.js",
+        "src/rendering/cell.js",
+        "src/api/cells-api.js",
+        "src/api/locks-api.js",
+        "src/api/typing-api.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/selection-editing-interaction-model.md",
+        "docs/grid/collaboration-model.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "riskTags": [
+        "editing",
+        "selection",
+        "locks",
+        "typing",
+        "save-race"
+      ]
+    },
+    "src/editing/clipboard.js": {
+      "dependsOn": [
+        "src/actions/selection.js",
+        "src/utils/tsv.js",
+        "src/state/view.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/selection-editing-interaction-model.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "riskTags": [
+        "clipboard",
+        "bulk-edit",
+        "selection"
+      ]
+    },
+    "src/interaction/mouse.js": {
+      "dependsOn": [
+        "src/actions/selection.js",
+        "src/editing/inline-editor.js",
+        "src/rendering/selection-ui.js",
+        "src/rendering/cell.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/selection-editing-interaction-model.md"
+      ],
+      "riskTags": [
+        "mouse",
+        "focus",
+        "selection"
+      ]
+    },
+    "src/interaction/keyboard.js": {
+      "dependsOn": [
+        "src/actions/selection.js",
+        "src/editing/inline-editor.js",
+        "src/editing/clipboard.js",
+        "src/rendering/selection-ui.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/selection-editing-interaction-model.md"
+      ],
+      "riskTags": [
+        "keyboard",
+        "navigation",
+        "editing"
+      ]
+    },
+    "src/interaction/fill-handle.js": {
+      "dependsOn": [
+        "src/actions/selection.js",
+        "src/editing/clipboard.js",
+        "src/rendering/selection-ui.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/selection-editing-interaction-model.md"
+      ],
+      "riskTags": [
+        "fill-handle",
+        "bulk-update"
+      ]
+    },
+    "src/interaction/column-drag.js": {
+      "dependsOn": [
+        "src/actions/column-actions.js",
+        "src/config/columns.js",
+        "src/state/persistence.js",
+        "src/rendering/grid.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/state-persistence.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "riskTags": [
+        "columns",
+        "reorder",
+        "layout",
+        "persistence"
+      ]
+    },
+    "src/api/client.js": {
+      "dependsOn": [
+        "src/component.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/public-api.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "riskTags": [
+        "api-base",
+        "request-routing",
+        "client-scope"
+      ]
+    },
+    "src/api/cells-api.js": {
+      "dependsOn": [
+        "src/api/client.js",
+        "src/state/normalize.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/data-contracts.md",
+        "docs/grid/collaboration-model.md"
+      ],
+      "riskTags": [
+        "batch-save",
+        "rowVer",
+        "conflict"
+      ],
+      "backendContracts": [
+        "POST /api/auditorRequests/batch"
+      ]
+    },
+    "src/api/rows-api.js": {
+      "dependsOn": [
+        "src/api/client.js",
+        "src/state/normalize.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/data-contracts.md",
+        "docs/grid/collaboration-model.md"
+      ],
+      "riskTags": [
+        "row-add",
+        "row-delete",
+        "live-sync"
+      ],
+      "backendContracts": [
+        "POST /api/auditorRequests/rows",
+        "POST /api/auditorRequests/rows/delete"
+      ]
+    },
+    "src/api/locks-api.js": {
+      "dependsOn": [
+        "src/api/client.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/collaboration-model.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "riskTags": [
+        "locks",
+        "redis",
+        "ttl",
+        "renewal"
+      ],
+      "backendContracts": [
+        "POST /api/locks/acquire",
+        "POST /api/locks/renew",
+        "POST /api/locks/release"
+      ]
+    },
+    "src/api/typing-api.js": {
+      "dependsOn": [
+        "src/api/client.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/collaboration-model.md"
+      ],
+      "riskTags": [
+        "typing-preview",
+        "realtime"
+      ],
+      "backendContracts": [
+        "POST /api/typing"
+      ]
+    },
+    "src/live/connection.js": {
+      "dependsOn": [
+        "src/live/handlers.js",
+        "src/api/client.js",
+        "src/state/view.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/collaboration-model.md",
+        "docs/grid/boot-sequence.md",
+        "docs/grid/public-api.md"
+      ],
+      "riskTags": [
+        "signalr",
+        "live-status",
+        "reconnect"
+      ],
+      "publicEventCoupling": [
+        "live"
+      ]
+    },
+    "src/live/handlers.js": {
+      "dependsOn": [
+        "src/live/connection.js",
+        "src/api/cells-api.js",
+        "src/api/locks-api.js",
+        "src/api/typing-api.js",
+        "src/ui/conflict-modal.js",
+        "src/rendering/cell.js",
+        "src/state/normalize.js",
+        "src/state/view.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/collaboration-model.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "riskTags": [
+        "gridPatch",
+        "gridRowAdded",
+        "gridRowsDeleted",
+        "gridLockChanged",
+        "gridTyping",
+        "realtime-state"
+      ]
+    },
+    "src/state/normalize.js": {
+      "dependsOn": [
+        "src/config/columns.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/data-contracts.md"
+      ],
+      "riskTags": [
+        "row-shape",
+        "reqNo-seqNum-mapping",
+        "rendering-impact"
+      ]
+    },
+    "src/state/persistence.js": {
+      "dependsOn": [
+        "src/config/defaults.js",
+        "src/config/columns.js",
+        "src/component.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/state-persistence.md",
+        "docs/grid/public-api.md"
+      ],
+      "riskTags": [
+        "localStorage",
+        "storage-key",
+        "schema-version"
+      ]
+    },
+    "src/state/view.js": {
+      "dependsOn": [
+        "src/state/normalize.js",
+        "src/actions/sorting.js",
+        "src/config/defaults.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/data-contracts.md",
+        "docs/grid/state-persistence.md"
+      ],
+      "riskTags": [
+        "derived-state",
+        "sorting",
+        "filtering"
+      ]
+    },
+    "src/rendering/grid.js": {
+      "dependsOn": [
+        "src/rendering/body.js",
+        "src/rendering/cell.js",
+        "src/rendering/selection-ui.js",
+        "src/virtualization/virtual-scroll.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/rendering-and-virtualization.md"
+      ],
+      "riskTags": [
+        "grid-rendering",
+        "virtualization",
+        "selection-ui"
+      ]
+    },
+    "src/rendering/body.js": {
+      "dependsOn": [
+        "src/rendering/cell.js",
+        "src/virtualization/virtual-scroll.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/rendering-and-virtualization.md"
+      ],
+      "riskTags": [
+        "row-rendering",
+        "virtual-window"
+      ]
+    },
+    "src/rendering/cell.js": {
+      "dependsOn": [
+        "src/state/view.js",
+        "src/config/columns.js",
+        "src/live/handlers.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/data-contracts.md",
+        "docs/grid/collaboration-model.md"
+      ],
+      "riskTags": [
+        "cell-rendering",
+        "lock-visuals",
+        "typing-preview"
+      ]
+    },
+    "src/rendering/selection-ui.js": {
+      "dependsOn": [
+        "src/actions/selection.js",
+        "src/virtualization/virtual-scroll.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/selection-editing-interaction-model.md",
+        "docs/grid/rendering-and-virtualization.md"
+      ],
+      "riskTags": [
+        "selection-overlay",
+        "alignment",
+        "virtualization"
+      ]
+    },
+    "src/virtualization/virtual-scroll.js": {
+      "dependsOn": [
+        "src/state/view.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/rendering-and-virtualization.md",
+        "docs/grid/known-limitations.md"
+      ],
+      "riskTags": [
+        "row-height",
+        "performance",
+        "visible-window"
+      ]
+    },
+    "src/ui/conflict-modal.js": {
+      "dependsOn": [
+        "src/live/handlers.js",
+        "src/api/cells-api.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/collaboration-model.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "riskTags": [
+        "conflict-resolution",
+        "user-choice-flow"
+      ]
+    },
+    "src/ui/toasts.js": {
+      "dependsOn": [
+        "src/component.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/public-api.md",
+        "docs/integration/grid-portal-contract.md"
+      ],
+      "riskTags": [
+        "toast-event",
+        "host-observability"
+      ],
+      "publicEventCoupling": [
+        "toast"
+      ]
+    },
+    "src/ui/filter-popover.js": {
+      "dependsOn": [
+        "src/actions/sorting.js",
+        "src/state/view.js",
+        "src/state/persistence.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/state-persistence.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "riskTags": [
+        "filters",
+        "ui-state"
+      ]
+    },
+    "src/ui/columns-popover.js": {
+      "dependsOn": [
+        "src/actions/column-actions.js",
+        "src/state/persistence.js",
+        "src/config/columns.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/state-persistence.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "riskTags": [
+        "column-visibility",
+        "column-width",
+        "persistence"
+      ]
+    },
+    "src/actions/sorting.js": {
+      "dependsOn": [
+        "src/state/view.js",
+        "src/config/defaults.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/data-contracts.md",
+        "docs/grid/state-persistence.md"
+      ],
+      "riskTags": [
+        "sorting",
+        "default-order",
+        "seqNum"
+      ]
+    },
+    "src/actions/selection.js": {
+      "dependsOn": [
+        "src/state/view.js",
+        "src/rendering/selection-ui.js"
+      ],
+      "relatedDocs": [
+        "docs/grid/selection-editing-interaction-model.md"
+      ],
+      "riskTags": [
+        "selection",
+        "navigation",
+        "editing-coupling"
+      ]
+    }
+  }
+}

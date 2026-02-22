@@ -1,0 +1,276 @@
+{
+  "schemaVersion": "1.1.0",
+  "description": "Index of docs with purpose, trust level, and maintenance hints. Includes current-vs-planned repo path awareness.",
+  "status": "starter-updated",
+  "lastVerified": "2026-02-22",
+  "docs": [
+    {
+      "path": "docs/00-project-overview.md",
+      "title": "Project Overview",
+      "area": "shared",
+      "purpose": "High-level architecture, status, boundaries, and AI workflow rules.",
+      "trustLevel": "overview",
+      "readPriority": "always",
+      "updateWhen": [
+        "major architecture changes",
+        "current repo reality changes",
+        "workflow rules change",
+        "project maturity/status materially changes"
+      ]
+    },
+    {
+      "path": "docs/AI_INDEX.md",
+      "title": "AI Index",
+      "area": "shared",
+      "purpose": "AI task routing and context-loading instructions.",
+      "trustLevel": "routing",
+      "readPriority": "always",
+      "updateWhen": [
+        "paths move",
+        "task categories evolve",
+        "public API/backend routing changes"
+      ]
+    },
+    {
+      "path": "docs/grid/overview.md",
+      "title": "Grid Overview",
+      "area": "grid",
+      "purpose": "Subsystem-level summary of the reusable grid component.",
+      "trustLevel": "as-built",
+      "readPriority": "grid-tasks",
+      "updateWhen": [
+        "grid capabilities change",
+        "subsystem ownership changes"
+      ]
+    },
+    {
+      "path": "docs/grid/public-api.md",
+      "title": "Grid Public API",
+      "area": "grid",
+      "purpose": "Public attributes, events, runtime attribute behavior, and host usage of <sheet-grid>.",
+      "trustLevel": "contract",
+      "readPriority": "integration-and-grid",
+      "updateWhen": [
+        "attributes change",
+        "events change",
+        "host initialization expectations change"
+      ]
+    },
+    {
+      "path": "docs/grid/data-contracts.md",
+      "title": "Grid Data Contracts",
+      "area": "grid",
+      "purpose": "REST/SignalR payload shapes, row/column data shape, rowVer contract, normalizer expectations.",
+      "trustLevel": "contract",
+      "readPriority": "grid-live-api",
+      "updateWhen": [
+        "backend payloads change",
+        "row shape changes",
+        "rowVer/conflict behavior changes"
+      ]
+    },
+    {
+      "path": "docs/grid/collaboration-model.md",
+      "title": "Grid Collaboration Model",
+      "area": "grid",
+      "purpose": "Locking, typing preview, live patching, conflict flow, SignalR handling lifecycle.",
+      "trustLevel": "as-built+contract",
+      "readPriority": "grid-live-api",
+      "updateWhen": [
+        "lock timings/flows change",
+        "SignalR event handling changes",
+        "conflict UX changes"
+      ]
+    },
+    {
+      "path": "docs/grid/boot-sequence.md",
+      "title": "Grid Boot Sequence",
+      "area": "grid",
+      "purpose": "Initialization order, reconnect behavior, and attribute-change reboot behavior.",
+      "trustLevel": "as-built",
+      "readPriority": "grid-core",
+      "updateWhen": [
+        "boot order changes",
+        "attribute change behavior changes",
+        "SignalR initialization timing changes"
+      ]
+    },
+    {
+      "path": "docs/grid/state-persistence.md",
+      "title": "Grid State Persistence",
+      "area": "grid",
+      "purpose": "localStorage UI persistence schema, storage-key behavior, and migration/versioning.",
+      "trustLevel": "as-built",
+      "readPriority": "grid-columns-filters",
+      "updateWhen": [
+        "storage-key behavior changes",
+        "schema changes",
+        "client-scoped persistence changes"
+      ]
+    },
+    {
+      "path": "docs/grid/rendering-and-virtualization.md",
+      "title": "Rendering and Virtualization",
+      "area": "grid",
+      "purpose": "Render pipeline, virtual scrolling, selection overlay interactions.",
+      "trustLevel": "as-built",
+      "readPriority": "grid-rendering",
+      "updateWhen": [
+        "virtualization logic changes",
+        "rendering lifecycle changes"
+      ]
+    },
+    {
+      "path": "docs/grid/selection-editing-interaction-model.md",
+      "title": "Selection Editing Interaction Model",
+      "area": "grid",
+      "purpose": "Keyboard/mouse/selection/editor behavior and interaction invariants.",
+      "trustLevel": "as-built+behavior",
+      "readPriority": "grid-interaction",
+      "updateWhen": [
+        "editing lifecycle changes",
+        "selection behavior changes",
+        "clipboard/fill integration changes"
+      ]
+    },
+    {
+      "path": "docs/grid/module-map.md",
+      "title": "Grid Module Map",
+      "area": "grid",
+      "purpose": "Ownership map of current root grid folders/files and future package target.",
+      "trustLevel": "routing",
+      "readPriority": "grid-tasks",
+      "updateWhen": [
+        "files move",
+        "folder responsibilities change"
+      ]
+    },
+    {
+      "path": "docs/grid/known-limitations.md",
+      "title": "Grid Known Limitations",
+      "area": "grid",
+      "purpose": "Known edge cases, limitations, and non-goals.",
+      "trustLevel": "known-issues",
+      "readPriority": "optional",
+      "updateWhen": [
+        "new limitation found",
+        "limitation fixed"
+      ]
+    },
+    {
+      "path": "docs/grid/behavior-invariants.md",
+      "title": "Grid Behavior Invariants",
+      "area": "grid",
+      "purpose": "Critical behaviors that must not regress during bug fixes/refactors.",
+      "trustLevel": "behavior-contract",
+      "readPriority": "recommended",
+      "status": "recommended-not-created",
+      "updateWhen": [
+        "critical behaviors added/changed",
+        "regression prevention rules updated"
+      ]
+    },
+    {
+      "path": "docs/integration/grid-portal-contract.md",
+      "title": "Grid Portal Contract",
+      "area": "integration",
+      "purpose": "Authoritative boundary and host ↔ grid integration contract.",
+      "trustLevel": "contract",
+      "readPriority": "integration-always",
+      "updateWhen": [
+        "public grid contract changes",
+        "host responsibilities change",
+        "portal integration behavior changes"
+      ]
+    },
+    {
+      "path": "docs/integration/data-mapping-portal-to-grid.md",
+      "title": "Portal to Grid Data Mapping",
+      "area": "integration",
+      "purpose": "Field-level mapping between portal domain data and grid row/column shape.",
+      "trustLevel": "contract",
+      "readPriority": "integration-data",
+      "status": "planned",
+      "updateWhen": [
+        "portal field mappings change",
+        "grid row shape changes"
+      ]
+    },
+    {
+      "path": "docs/integration/theme-and-styling-contract.md",
+      "title": "Theme and Styling Contract",
+      "area": "integration",
+      "purpose": "Theme token/styling rules across host app and grid Shadow DOM.",
+      "trustLevel": "contract",
+      "readPriority": "integration-theme",
+      "status": "planned",
+      "updateWhen": [
+        "theme API changes",
+        "Shadow DOM styling strategy changes"
+      ]
+    },
+    {
+      "path": "docs/portal/overview.md",
+      "title": "Portal Overview",
+      "area": "portal",
+      "purpose": "Future portal app scope and architecture (current portal code not yet in apps/portal).",
+      "trustLevel": "plan+summary",
+      "readPriority": "portal-tasks",
+      "status": "planned",
+      "updateWhen": [
+        "portal implementation begins",
+        "portal architecture decisions change"
+      ]
+    },
+    {
+      "path": "docs/portal/poc-to-modular-migration-plan.md",
+      "title": "Portal POC to Modular Migration Plan",
+      "area": "portal",
+      "purpose": "Plan for converting prior single-file portal POC into modular app code.",
+      "trustLevel": "plan",
+      "readPriority": "portal-refactor",
+      "status": "planned",
+      "updateWhen": [
+        "migration plan changes",
+        "milestones complete"
+      ]
+    },
+    {
+      "path": "services/auditor-grid-api/docs/api-overview.md",
+      "title": "Backend API Overview",
+      "area": "backend",
+      "purpose": "Azure Functions endpoint summary for grid and future services.",
+      "trustLevel": "contract-summary",
+      "readPriority": "backend-api",
+      "status": "planned",
+      "updateWhen": [
+        "endpoint list changes"
+      ]
+    },
+    {
+      "path": "services/auditor-grid-api/docs/rows-cells-locks-contracts.md",
+      "title": "Rows Cells Locks Contracts",
+      "area": "backend",
+      "purpose": "Detailed request/response payloads for rows/cells/locks endpoints.",
+      "trustLevel": "contract",
+      "readPriority": "backend-api",
+      "status": "planned",
+      "updateWhen": [
+        "payloads change",
+        "conflict/lock responses change"
+      ]
+    },
+    {
+      "path": "services/auditor-grid-api/docs/signalr-events.md",
+      "title": "SignalR Events",
+      "area": "backend",
+      "purpose": "Hub, negotiate contract, and event payload definitions.",
+      "trustLevel": "contract",
+      "readPriority": "backend-live",
+      "status": "planned",
+      "updateWhen": [
+        "event names or payloads change"
+      ]
+    }
+  ]
+}
