@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sheet Grid Demo</title>
+  <!--
+    SignalR client must be loaded before sheet-grid.js.
+    In production, use your own CDN URL or bundle it.
+    Needs verification: confirm CDN URL with the deployment team.
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr@8/dist/browser/signalr.min.js"></script>
+  <script type="module" src="sheet-grid.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 1rem; }
+    sheet-grid { display: block; width: 100%; height: calc(100vh - 2rem); }
+  </style>
+</head>
+<body>
+  <!--
+    Attributes
+      api-base   : base URL for all REST calls (no trailing slash)
+      client-id  : unique opaque identifier for this browser session / tab
+      user-id    : authenticated user identifier (passed in X-User-Id header)
+      storage-key: localStorage key used to persist lightweight UI state
+      readonly   : boolean presence attribute — omit to allow editing
+  -->
+  <sheet-grid
+    api-base="/api"
+    client-id="demo-client-001"
+    user-id="demo-user"
+    storage-key="sheet-grid-demo"
+  ></sheet-grid>
+
+  <script type="module">
+    // Example: listen for live-connection state changes
+    document.querySelector('sheet-grid').addEventListener('live', (ev) => {
+      console.log('Live connection:', ev.detail.connected, ev.detail.reason ?? '');
+    });
+
+    // Example: listen for toast notifications
+    document.querySelector('sheet-grid').addEventListener('toast', (ev) => {
+      console.log(`[${ev.detail.level}] ${ev.detail.message}`);
+    });
+  </script>
+</body>
+</html>
