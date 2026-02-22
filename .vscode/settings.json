@@ -1,0 +1,5 @@
+{
+    "appService.defaultWebAppToDeploy": "/subscriptions/b69533cf-a303-418c-b32a-44d9e543e03d/resourceGroups/auditor-request-tracking-dashboard-nitto_group/providers/Microsoft.Web/sites/auditor-request-tracking-dashboard-nitto",
+    "appService.deploySubpath": ".",
+    "liveServer.settings.port": 5501
+}

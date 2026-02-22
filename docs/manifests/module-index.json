@@ -1,0 +1,210 @@
+{
+  "schemaVersion": "1.1.0",
+  "description": "Maps modules/folders to ownership and responsibilities for AI context routing. Reflects current live root paths and planned scaffold paths.",
+  "status": "starter-updated",
+  "lastVerified": "2026-02-22",
+  "pathMode": {
+    "currentCanonical": "root-live-code",
+    "futureTarget": "monorepo-scaffold"
+  },
+  "modules": [
+    {
+      "id": "docs.shared",
+      "path": "docs/",
+      "status": "active",
+      "type": "documentation",
+      "owner": "shared",
+      "responsibilities": [
+        "project overview",
+        "AI routing guidance",
+        "grid/portal/integration docs",
+        "manifests"
+      ],
+      "primaryDocs": [
+        "docs/00-project-overview.md",
+        "docs/AI_INDEX.md"
+      ]
+    },
+    {
+      "id": "grid.live-root",
+      "path": "src/",
+      "status": "active",
+      "type": "application-module-set",
+      "owner": "grid",
+      "entryFiles": [
+        "index.html",
+        "sheet-grid.js",
+        "src/component.js"
+      ],
+      "responsibilities": [
+        "current working sheet-grid component implementation",
+        "grid rendering, editing, collaboration, persistence, UI"
+      ],
+      "primaryDocs": [
+        "docs/grid/overview.md",
+        "docs/grid/public-api.md",
+        "docs/grid/data-contracts.md",
+        "docs/grid/collaboration-model.md",
+        "docs/grid/module-map.md"
+      ],
+      "submodules": [
+        {
+          "id": "grid.config",
+          "path": "src/config/",
+          "responsibilities": [
+            "column definitions",
+            "defaults"
+          ]
+        },
+        {
+          "id": "grid.api",
+          "path": "src/api/",
+          "responsibilities": [
+            "Azure Functions REST calls",
+            "rows/cells/locks/typing clients"
+          ]
+        },
+        {
+          "id": "grid.live",
+          "path": "src/live/",
+          "responsibilities": [
+            "SignalR connection and event handlers"
+          ]
+        },
+        {
+          "id": "grid.state",
+          "path": "src/state/",
+          "responsibilities": [
+            "normalization",
+            "view derivation",
+            "UI persistence"
+          ]
+        },
+        {
+          "id": "grid.rendering",
+          "path": "src/rendering/",
+          "responsibilities": [
+            "shell/grid/body/cell rendering",
+            "selection UI visuals"
+          ]
+        },
+        {
+          "id": "grid.editing",
+          "path": "src/editing/",
+          "responsibilities": [
+            "inline editor",
+            "clipboard"
+          ]
+        },
+        {
+          "id": "grid.interaction",
+          "path": "src/interaction/",
+          "responsibilities": [
+            "mouse/keyboard/fill/column drag"
+          ]
+        },
+        {
+          "id": "grid.virtualization",
+          "path": "src/virtualization/",
+          "responsibilities": [
+            "virtual scrolling"
+          ]
+        },
+        {
+          "id": "grid.ui",
+          "path": "src/ui/",
+          "responsibilities": [
+            "toasts",
+            "conflict modal",
+            "context menu",
+            "popovers"
+          ]
+        },
+        {
+          "id": "grid.actions",
+          "path": "src/actions/",
+          "responsibilities": [
+            "row/column/sort/selection actions"
+          ]
+        },
+        {
+          "id": "grid.utils",
+          "path": "src/utils/",
+          "responsibilities": [
+            "datetime/dom/format/helpers/tsv"
+          ]
+        },
+        {
+          "id": "grid.styles",
+          "path": "src/styles/",
+          "responsibilities": [
+            "grid styles"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "grid.future-package",
+      "path": "packages/sheet-grid/",
+      "status": "scaffold-empty",
+      "type": "package",
+      "owner": "grid",
+      "responsibilities": [
+        "intended future home of sheet-grid code"
+      ],
+      "notes": [
+        "Do not treat as live code until migration occurs."
+      ]
+    },
+    {
+      "id": "portal.future-app",
+      "path": "apps/portal/",
+      "status": "scaffold-empty",
+      "type": "application",
+      "owner": "portal",
+      "responsibilities": [
+        "intended future Auditor Request Tracker portal app"
+      ],
+      "primaryDocs": [
+        "docs/portal/overview.md",
+        "docs/portal/poc-to-modular-migration-plan.md"
+      ]
+    },
+    {
+      "id": "backend.future-service-home",
+      "path": "services/auditor-grid-api/",
+      "status": "scaffold-partial",
+      "type": "service",
+      "owner": "backend",
+      "responsibilities": [
+        "intended future home for Azure Functions backend code/docs"
+      ],
+      "notes": [
+        "Backend functionality exists, but repo service folder is not yet populated with live code."
+      ],
+      "primaryDocs": [
+        "services/auditor-grid-api/README.md",
+        "services/auditor-grid-api/docs/api-overview.md",
+        "services/auditor-grid-api/docs/rows-cells-locks-contracts.md",
+        "services/auditor-grid-api/docs/signalr-events.md"
+      ]
+    },
+    {
+      "id": "integration.docs",
+      "path": "docs/integration/",
+      "status": "active",
+      "type": "documentation",
+      "owner": "integration",
+      "responsibilities": [
+        "grid-portal contract",
+        "data mapping contract",
+        "theme/styling contract"
+      ],
+      "primaryDocs": [
+        "docs/integration/grid-portal-contract.md",
+        "docs/integration/data-mapping-portal-to-grid.md",
+        "docs/integration/theme-and-styling-contract.md"
+      ]
+    }
+  ]
+}

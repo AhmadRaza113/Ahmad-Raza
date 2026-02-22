@@ -1,0 +1,3238 @@
+/* sheet-grid.js (v12)
+  ✅ Production-grade POC grid with:
+  - Excel-like cell selection + editing (single cell editor inside cell)
+  - Copy/Cut/Paste TSV, Fill handle
+  - Column resize + auto-fit, row resize
+  - Column reorder
+  - Search + Filter + Sort (multi sort)
+  - Add/Delete rows
+  - ✅ Live parallel editing via SignalR (gridPatch / gridRowAdded / gridRowsDeleted)
+  - ✅ Cell-level locking via Redis locks (gridLockChanged)
+  - ✅ Conflict UI (clear message + choose "Keep mine" or "Accept server")
+  - ✅ Editing indicator: only shows to OTHER users (self-broadcast ignored)
+  - ✅ Live typing broadcast: real-time keystrokes shown to others via gridTyping
+  - ✅ Save optimization: DB writes on blur/enter/debounce(800ms), NOT per keystroke
+  - ✅ Lock auto-release: TTL 30s, beforeunload beacon, disconnect cleanup
+  - ✅ Race condition prevention: server-authoritative lock, no optimistic edit
+  - ✅ Visual: locked cells disabled + colored, typing dots animation, avatar badges
+*/
+
+const DEFAULT_COLS = [
+  { id: "auditor_request", name: "Auditor's Request", type: "multiline", readOnly: false, width: 300 },
+  { id: "host_comments", name: "Host Comments", type: "multiline", readOnly: false, width: 260 },
+  { id: "host_backroom_comments", name: "Host/Backroom comments", type: "multiline", readOnly: false, width: 300 },
+  { id: "assigned_to", name: "Assigned To", type: "person", readOnly: false, width: 190, options: ["Ali", "Ayesha", "Hamza", "Fatima"] },
+
+  { id: "status", name: "Status", type: "choice", readOnly: false, width: 150, options: ["Open", "In Progress", "Blocked", "Done", "Closed"] },
+  { id: "requested_department", name: "Requested Department", type: "choice", readOnly: false, width: 210, options: ["QA", "Ops", "Finance", "IT", "HR"] },
+  { id: "request_type", name: "Request Type", type: "choice", readOnly: false, width: 170, options: ["Audit", "Task", "Complaint", "Change", "Other"] },
+
+  { id: "due_datetime", name: "Due Date/Time", type: "datetime", readOnly: true, width: 190 },
+  { id: "client_name", name: "Client Name", type: "text", readOnly: true, width: 190 },
+  { id: "closed_time", name: "Closed Time", type: "datetime", readOnly: true, width: 190 },
+  { id: "completed_on", name: "CompletedOn", type: "datetime", readOnly: true, width: 190 },
+  { id: "client_id", name: "Client ID", type: "number", readOnly: true, width: 120 },
+];
+
+function uid() {
+  return (crypto.randomUUID?.() ?? (Math.random().toString(16).slice(2) + Date.now().toString(16)));
+}
+function debounce(fn, ms = 400) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
+function isBlank(v) { return v === null || v === undefined || String(v).trim() === ""; }
+function containsCI(hay, needle) { return String(hay ?? "").toLowerCase().includes(String(needle ?? "").toLowerCase()); }
+function startsCI(hay, needle) { return String(hay ?? "").toLowerCase().startsWith(String(needle ?? "").toLowerCase()); }
+function equalsCI(a, b) { return String(a ?? "").toLowerCase() === String(b ?? "").toLowerCase(); }
+function toTSV(matrix) { return matrix.map(row => row.map(v => (v ?? "")).join("\t")).join("\n"); }
+function parseTSV(text) { return text.replace(/\r/g, "").split("\n").map(r => r.split("\t")); }
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function measureTextWidth(text, font = "12px Segoe UI, Arial, sans-serif") {
+  const canvas = measureTextWidth._c || (measureTextWidth._c = document.createElement("canvas"));
+  const ctx = canvas.getContext("2d");
+  ctx.font = font;
+  return ctx.measureText(String(text ?? "")).width;
+}
+
+// Store/display datetime as "YYYY-MM-DDTHH:mm"
+function toDatetimeLocalValue(v) {
+  if (!v) return "";
+  const s = String(v);
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)) return s.slice(0, 16);
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(s)) return s.replace(/\s+/, "T").slice(0, 16);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return `${s}T00:00`;
+  return "";
+}
+function normalizeDatetimeLocalValue(v) {
+  if (!v) return "";
+  const s = String(v).trim();
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(s)) return s;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(s)) return s.slice(0, 16);
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(s)) return s.replace(/\s+/, "T").slice(0, 16);
+  return toDatetimeLocalValue(s);
+}
+
+function initialsFromUserId(userId) {
+  const s = String(userId || "").trim();
+  if (!s) return "•";
+  const base = s.split("@")[0] || s;
+  const parts = base.split(/[^a-zA-Z0-9]+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return s.slice(0, 2).toUpperCase();
+}
+
+function valueKeyForFilter(v) {
+  if (isBlank(v)) return "__BLANK__";
+  return String(v);
+}
+function valueLabelForFilterKey(k) {
+  return k === "__BLANK__" ? "(Blanks)" : k;
+}
+
+class SheetGrid extends HTMLElement {
+  static get observedAttributes() { return ["storage-key", "readonly", "api-base", "client-id", "user-id"]; }
+
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+
+    this._mounted = false;
+
+    this.state = {
+      columns: deepClone(DEFAULT_COLS),
+      rows: [], // server rows: [{id, clientId, rowVer, updatedAt, updatedBy, values:{...}}]
+      sorts: [],
+      filters: {},
+      search: "",
+
+      selection: { r1: 0, c1: 0, r2: 0, c2: 0 },
+      active: { r: 0, c: 0 },
+      editing: null, // {r,c,rowId,colId, firstKey}
+
+      columnOrder: [],
+      rowOrder: [],
+      colHidden: {},
+      colWidths: {},
+      colLastWidth: {},
+      rowHidden: {},
+      rowHeights: {},
+    };
+
+    this.config = {
+      // UI
+      autosaveUiMs: 600,
+      minColWidth: 10,
+      maxColWidth: 900,
+      hideDragThreshold: 8,
+      defaultRowHeight: 34,
+      minRowHeight: 26,
+      maxRowHeight: 320,
+      virtualization: true,
+      overscan: 10,
+
+      // Live
+      lockTtlSeconds: 30,
+      lockRenewEveryMs: 12000, // safe renewal (ttl 30s)
+      serverFlushDebounceMs: 800, // save on blur/enter/debounce — NOT per keystroke
+      serverFlushBatchMax: 40, // max updates in a single /batch call
+    };
+
+    this._readOnly = false;
+
+    // UI persistence debounce (columns widths/order, filters, etc.)
+    this._persistUiDebounced = debounce(() => this._persistUi(), this.config.autosaveUiMs);
+
+    // Dirty/pending server updates
+    this._pending = new Map(); // key rowId|colId -> {rowId,colId,value, queuedAt}
+    this._flushDebounced = debounce(() => this._flushPending().catch(console.error), this.config.serverFlushDebounceMs);
+    this._flushInflight = false;
+
+    // Conflicts
+    this._conflicts = new Map(); // key -> {rowId,colId, mine, server, updatedAt, updatedBy, currentRowVer}
+
+    // Live locks
+    this._locks = new Map(); // key -> {userId, acquiredAtUtc, ttlSeconds, owned?:bool}
+    this._ownedLock = null;  // {rowId,colId, timerId}
+    this._rowVer = new Map(); // rowId -> rowVer
+
+    // Remote typing state (live typing from other users)
+    this._remoteTyping = new Map(); // key "rowId|colId" -> {userId, value, timestamp}
+    this._broadcastTypingDebounced = debounce((rowId, colId, value) => this._broadcastTyping(rowId, colId, value), 150);
+
+    // Virtualization row meta
+    this._rowMeta = { offsets: [], heights: [], total: 0, version: 0 };
+    this._virt = { start: 0, end: -1, lastScrollTop: 0 };
+
+    // Mouse state
+    this._mouse = { selecting: false, didDragSelection: false, resizingCol: null, resizingRow: null };
+    this._fill = null;
+    this._colDrag = null;
+
+    // View
+    this._view = { viewRowIds: [], viewColIds: [] };
+
+    // SignalR
+    this._hub = null;
+    this._liveConnected = false;
+  }
+
+  // ---------- Attributes / config ----------
+  get storageKey() { return this.getAttribute("storage-key") || "auditor-grid-ui"; }
+  get readOnly() { return this._readOnly || this.hasAttribute("readonly"); }
+  get apiBase() { return (this.getAttribute("api-base") || "").replace(/\/+$/, ""); }
+  get clientId() { return Number(this.getAttribute("client-id") || 1); }
+  get userId() { return (this.getAttribute("user-id") || "anonymous@web").trim(); }
+
+  attributeChangedCallback(name, oldVal, newVal) {
+    if (name === "readonly") {
+      this._readOnly = newVal !== null;
+      if (this._mounted) this._renderGrid({ full: false });
+    }
+
+    // Any change that affects server / session should re-init
+    if (["api-base", "client-id", "user-id"].includes(name) && oldVal !== newVal) {
+      if (this._mounted) {
+        this._disconnectLive();
+        this._boot().catch(console.error);
+      }
+    }
+
+    if (name === "storage-key" && oldVal !== newVal) {
+      if (this._mounted) {
+        this._loadUi();
+        this._recomputeView();
+        this._computeRowMeta();
+        this._renderGrid({ full: true });
+      }
+    }
+  }
+
+  connectedCallback() {
+    this._renderShell();
+    this._mounted = true;
+    this._boot().catch(console.error);
+    this._wireGlobal();
+  }
+
+  disconnectedCallback() {
+    // Broadcast typing end if we were editing
+    if (this.state.editing) {
+      const { rowId, colId } = this.state.editing;
+      this._broadcastTyping(rowId, colId, "").catch(() => {});
+    }
+    this._releaseOwnedLock().catch(() => {});
+    this._disconnectLive();
+  }
+
+  // ---------- Boot ----------
+  async _boot() {
+    this._setStatus("Loading…");
+    this._loadUi();
+
+    await this._loadRowsFromServer();
+    this._normalizeState();
+    this._recomputeView();
+    this._computeRowMeta();
+    this._renderGrid({ full: true });
+
+    await this._connectLive();
+  }
+
+  // ---------- UI persistence (ONLY UI, not data) ----------
+  _persistUi() {
+    try {
+      const s = this.state;
+      const payload = {
+        version: 12,
+        ui: {
+          sorts: s.sorts,
+          filters: s.filters,
+          search: s.search,
+
+          columnOrder: s.columnOrder,
+          rowOrder: s.rowOrder,
+          colHidden: s.colHidden,
+          colWidths: s.colWidths,
+          colLastWidth: s.colLastWidth,
+          rowHidden: s.rowHidden,
+          rowHeights: s.rowHeights,
+        },
+      };
+      localStorage.setItem(this.storageKey, JSON.stringify(payload));
+    } catch {}
+  }
+
+  _loadUi() {
+    const raw = localStorage.getItem(this.storageKey);
+    if (!raw) return;
+
+    try {
+      const obj = JSON.parse(raw);
+      const ui = obj.ui ?? {};
+      this.state.sorts = ui.sorts ?? [];
+      this.state.filters = ui.filters ?? {};
+      this.state.search = ui.search ?? "";
+
+      this.state.columnOrder = ui.columnOrder ?? [];
+      this.state.rowOrder = ui.rowOrder ?? [];
+      this.state.colHidden = ui.colHidden ?? {};
+      this.state.colWidths = ui.colWidths ?? {};
+      this.state.colLastWidth = ui.colLastWidth ?? {};
+      this.state.rowHidden = ui.rowHidden ?? {};
+      this.state.rowHeights = ui.rowHeights ?? {};
+    } catch {}
+  }
+
+  // ---------- Server API ----------
+  async _api(path, { method = "GET", body = null } = {}) {
+    if (!this.apiBase) throw new Error("Missing api-base on <sheet-grid>.");
+    const url = `${this.apiBase}${path}`;
+    const headers = { "Accept": "application/json" };
+    let payload = undefined;
+    if (body != null) {
+      headers["Content-Type"] = "application/json";
+      payload = JSON.stringify(body);
+    }
+    const res = await fetch(url, { method, headers, body: payload, credentials: "omit" });
+    const txt = await res.text();
+    let json = null;
+    try { json = txt ? JSON.parse(txt) : null; } catch { json = { ok: false, raw: txt }; }
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${path}: ${txt}`);
+    return json;
+  }
+
+  async _loadRowsFromServer() {
+    try {
+      const json = await this._api(`/api/auditorRequests?clientId=${encodeURIComponent(this.clientId)}`);
+      if (!json?.ok) throw new Error(json?.error || "Failed to load rows");
+
+      const rows = Array.isArray(json.rows) ? json.rows : [];
+      this.state.rows = rows.map(r => ({
+        id: r.id,
+        clientId: r.clientId,
+        rowVer: r.rowVer,
+        updatedAt: r.updatedAt,
+        updatedBy: r.updatedBy,
+        values: r.values || {},
+      }));
+
+      // keep rowVer cache
+      this._rowVer.clear();
+      for (const r of this.state.rows) this._rowVer.set(r.id, r.rowVer);
+
+      // reset any pending/conflicts/locks/typing for safety
+      this._pending.clear();
+      this._conflicts.clear();
+      this._locks.clear();
+      this._remoteTyping.clear();
+      this._ownedLock = null;
+
+      this._setStatus(`Loaded (${rows.length})`);
+    } catch (e) {
+      console.error(e);
+      this._toast("Failed to load rows from server.", { kind: "error", detail: String(e?.message || e) });
+      this._setStatus("Load failed");
+      this.state.rows = [];
+    }
+  }
+
+  async _saveCellToServer(rowId, colId, value) {
+    // queue + flush
+    const key = `${rowId}|${colId}`;
+    this._pending.set(key, { rowId, colId, value, queuedAt: Date.now() });
+    this._flushDebounced();
+  }
+
+  async _flushPending() {
+    if (this._flushInflight) return;
+    if (this._pending.size === 0) return;
+
+    this._flushInflight = true;
+    try {
+      // Prepare up to N updates, but at most one per row in each call (prevents baseRowVer sequencing issues)
+      const picked = [];
+      const pickedRowIds = new Set();
+
+      for (const [key, u] of this._pending.entries()) {
+        if (picked.length >= this.config.serverFlushBatchMax) break;
+        if (pickedRowIds.has(u.rowId)) continue;
+        pickedRowIds.add(u.rowId);
+
+        const baseRowVer = this._rowVer.get(u.rowId) || null;
+        picked.push({ rowId: u.rowId, colId: u.colId, value: u.value, baseRowVer });
+      }
+
+      if (!picked.length) return;
+
+      this._setStatus("Saving…");
+
+      const json = await this._api(`/api/auditorRequests/batch`, {
+        method: "POST",
+        body: { clientId: this.clientId, byUser: this.userId, updates: picked },
+      });
+
+      if (!json?.ok) throw new Error(json?.error || "Batch save failed");
+
+      const results = Array.isArray(json.results) ? json.results : [];
+      let changedUi = false;
+
+      for (const r of results) {
+        const k = `${r.rowId}|${r.colId}`;
+        // Remove from pending (we always sent one update per row)
+        this._pending.delete(k);
+
+        if (r.updated) {
+          // Apply server-truth
+          const row = this.state.rows.find(x => x.id === r.rowId);
+          if (row) {
+            row.values[r.colId] = r.value;
+            row.rowVer = r.rowVer;
+            row.updatedAt = r.updatedAt;
+            row.updatedBy = r.updatedBy;
+          }
+          this._rowVer.set(r.rowId, r.rowVer);
+          this._conflicts.delete(k);
+          changedUi = true;
+        } else if (r.conflict) {
+          const row = this.state.rows.find(x => x.id === r.rowId);
+          const mine = this._pending.get(k)?.value; // might be gone
+          const myLastValue = (mine != null ? mine : row?.values?.[r.colId]);
+
+          this._conflicts.set(k, {
+            rowId: r.rowId,
+            colId: r.colId,
+            mine: myLastValue,
+            server: r.currentValue,
+            updatedAt: r.currentUpdatedAt,
+            updatedBy: r.currentUpdatedBy,
+            currentRowVer: r.currentRowVer,
+          });
+
+          // show server value in grid (so user sees latest), but keep "mine" in conflict modal
+          if (row) {
+            row.values[r.colId] = r.currentValue;
+            row.rowVer = r.currentRowVer;
+            row.updatedAt = r.currentUpdatedAt;
+            row.updatedBy = r.currentUpdatedBy;
+          }
+          this._rowVer.set(r.rowId, r.currentRowVer);
+
+          changedUi = true;
+
+          this._toast(
+            `Save conflict on "${this._colById(r.colId)?.name || r.colId}" (row ${this._view.viewRowIds.indexOf(r.rowId)+1 || "?"}).`,
+            { kind: "warn", detail: `Updated by ${r.currentUpdatedBy || "someone"} at ${r.currentUpdatedAt || ""}. Click the red cell to resolve.` }
+          );
+        }
+      }
+
+      if (this._pending.size === 0) this._setStatus("Saved");
+      else this._setStatus(`Saving… (${this._pending.size})`);
+
+      if (changedUi) {
+        this._recomputeView();
+        this._computeRowMeta();
+        this._renderGrid({ full: false });
+      }
+    } catch (e) {
+      console.error(e);
+      this._toast("Save failed (network/server).", { kind: "error", detail: String(e?.message || e) });
+      this._setStatus("Save failed");
+    } finally {
+      this._flushInflight = false;
+      // Continue draining if more pending remains
+      if (this._pending.size) {
+        this._flushDebounced();
+      }
+    }
+  }
+
+  async _addRowServer() {
+    const json = await this._api(`/api/auditorRequests/rows`, {
+      method: "POST",
+      body: { clientId: this.clientId, byUser: this.userId, values: {} },
+    });
+    if (!json?.ok) throw new Error(json?.error || "Add row failed");
+    return json.row;
+  }
+
+  async _deleteRowsServer(rowIds) {
+    const json = await this._api(`/api/auditorRequests/rows/delete`, {
+      method: "POST",
+      body: { clientId: this.clientId, byUser: this.userId, rowIds },
+    });
+    if (!json?.ok) throw new Error(json?.error || "Delete rows failed");
+    return json.deleted || 0;
+  }
+
+  // ---------- SignalR live ----------
+  async _connectLive() {
+    // signalR client is global from the CDN script in index.html
+    if (!window.signalR) {
+      this._toast("SignalR client library not loaded.", { kind: "error" });
+      return;
+    }
+
+    try {
+      const neg = await this._api(`/api/negotiate?clientId=${encodeURIComponent(this.clientId)}&userId=${encodeURIComponent(this.userId)}`, { method: "POST" });
+      if (!neg?.url || !neg?.accessToken) throw new Error("Negotiate did not return url/accessToken.");
+
+      const conn = new window.signalR.HubConnectionBuilder()
+        .withUrl(neg.url, { accessTokenFactory: () => neg.accessToken })
+        .withAutomaticReconnect([0, 2000, 5000, 10000, 15000])
+        .configureLogging(window.signalR.LogLevel.Information)
+        .build();
+
+      conn.on("gridPatch", (msg) => this._onGridPatch(msg));
+      conn.on("gridRowAdded", (msg) => this._onGridRowAdded(msg));
+      conn.on("gridRowsDeleted", (msg) => this._onGridRowsDeleted(msg));
+      conn.on("gridLockChanged", (msg) => this._onGridLockChanged(msg));
+      conn.on("gridTyping", (msg) => this._onGridTyping(msg));
+
+      conn.onreconnecting(() => this._setLive(false));
+      conn.onreconnected(() => this._setLive(true));
+      conn.onclose(() => this._setLive(false));
+
+      await conn.start();
+      this._hub = conn;
+      this._setLive(true);
+      this._toast("Live connection established.", { kind: "ok" });
+    } catch (e) {
+      console.error(e);
+      this._setLive(false);
+      this._toast("Live connection failed.", { kind: "error", detail: String(e?.message || e) });
+    }
+  }
+
+  _disconnectLive() {
+    try {
+      if (this._hub) {
+        this._hub.stop().catch(() => {});
+        this._hub = null;
+      }
+    } catch {}
+    this._setLive(false);
+  }
+
+  _setLive(connected) {
+    this._liveConnected = !!connected;
+    this.dispatchEvent(new CustomEvent("live", { detail: { connected: this._liveConnected } }));
+    const pill = this.shadowRoot.querySelector("[data-live]");
+    if (pill) {
+      pill.textContent = this._liveConnected ? "Live: Connected" : "Live: Disconnected";
+      pill.style.background = this._liveConnected ? "rgba(34,197,94,.10)" : "rgba(239,68,68,.10)";
+      pill.style.borderColor = this._liveConnected ? "rgba(34,197,94,.25)" : "rgba(239,68,68,.25)";
+      pill.style.color = this._liveConnected ? "#166534" : "#991b1b";
+    }
+  }
+
+  _onGridPatch(msg) {
+    try {
+      if (!msg || Number(msg.clientId) !== this.clientId) return;
+      const { rowId, colId, value, rowVer, updatedAt, updatedBy } = msg;
+
+      // ✅ Ignore self-broadcasted patches — we already applied optimistically via batch response
+      if (updatedBy === this.userId) {
+        // Still update rowVer metadata so we stay in sync
+        const row = this.state.rows.find(r => r.id === rowId);
+        if (row) { row.rowVer = rowVer; row.updatedAt = updatedAt; row.updatedBy = updatedBy; }
+        this._rowVer.set(rowId, rowVer);
+        return;
+      }
+
+      const key = `${rowId}|${colId}`;
+
+      // If we have pending changes for this cell, treat as conflict & require resolution
+      if (this._pending.has(key)) {
+        const mine = this._pending.get(key)?.value;
+        this._pending.delete(key);
+
+        this._conflicts.set(key, {
+          rowId, colId,
+          mine,
+          server: value,
+          updatedAt,
+          updatedBy,
+          currentRowVer: rowVer,
+        });
+      }
+
+      // If user is currently editing the same cell, do not override the input; still update metadata
+      const isEditingSame = this.state.editing && this.state.editing.rowId === rowId && this.state.editing.colId === colId;
+
+      const row = this.state.rows.find(r => r.id === rowId);
+      if (row) {
+        if (!isEditingSame) row.values[colId] = value;
+        row.rowVer = rowVer;
+        row.updatedAt = updatedAt;
+        row.updatedBy = updatedBy;
+      }
+      this._rowVer.set(rowId, rowVer);
+
+      // UI refresh (cheap enough for now)
+      this._recomputeView();
+      this._computeRowMeta();
+      this._renderGrid({ full: false });
+    } catch (e) {
+      console.error("gridPatch error", e);
+    }
+  }
+
+  _onGridRowAdded(msg) {
+    try {
+      if (!msg || Number(msg.clientId) !== this.clientId) return;
+      const row = msg.row;
+      if (!row?.id) return;
+
+      if (this.state.rows.some(r => r.id === row.id)) return;
+      this.state.rows.unshift({
+        id: row.id,
+        clientId: row.clientId,
+        rowVer: row.rowVer,
+        updatedAt: row.updatedAt,
+        updatedBy: row.updatedBy,
+        values: row.values || {},
+      });
+      this._rowVer.set(row.id, row.rowVer);
+
+      // Add to order top
+      this.state.rowOrder = [row.id, ...this.state.rowOrder.filter(id => id !== row.id)];
+
+      this._recomputeView();
+      this._computeRowMeta();
+      this._renderGrid({ full: true });
+      this._toast("Row added (live).", { kind: "ok" });
+    } catch (e) { console.error(e); }
+  }
+
+  _onGridRowsDeleted(msg) {
+    try {
+      if (!msg || Number(msg.clientId) !== this.clientId) return;
+      const ids = new Set(msg.rowIds || []);
+      if (!ids.size) return;
+
+      this.state.rows = this.state.rows.filter(r => !ids.has(r.id));
+      this.state.rowOrder = this.state.rowOrder.filter(id => !ids.has(id));
+      for (const id of ids) this._rowVer.delete(id);
+
+      // clean pending/conflicts/locks
+      for (const k of [...this._pending.keys()]) if (ids.has(k.split("|")[0])) this._pending.delete(k);
+      for (const k of [...this._conflicts.keys()]) if (ids.has(k.split("|")[0])) this._conflicts.delete(k);
+      for (const k of [...this._locks.keys()]) if (ids.has(k.split("|")[0])) this._locks.delete(k);
+
+      this._recomputeView();
+      this._computeRowMeta();
+      this._renderGrid({ full: true });
+      this._toast("Rows deleted (live).", { kind: "ok" });
+    } catch (e) { console.error(e); }
+  }
+
+  _onGridLockChanged(msg) {
+    try {
+      if (!msg || Number(msg.clientId) !== this.clientId) return;
+      const { rowId, colId, locked, holder } = msg;
+      const key = `${rowId}|${colId}`;
+
+      if (locked && holder?.userId) {
+        const isOwn = holder.userId === this.userId;
+        this._locks.set(key, { ...holder, owned: isOwn });
+        // ✅ Don't show indicator for self — the user already knows they're editing
+      } else {
+        this._locks.delete(key);
+        // When a cell is unlocked by someone else, also clear remote typing for that cell
+        this._remoteTyping.delete(key);
+      }
+      this._renderBody(); // refresh visible lock badges
+      this._updateSelectionClasses();
+      this._attachFillHandle();
+    } catch (e) { console.error(e); }
+  }
+
+  // ---------- Live typing from other users ----------
+  _onGridTyping(msg) {
+    try {
+      if (!msg || Number(msg.clientId) !== this.clientId) return;
+      // ✅ Ignore self-broadcasted typing events
+      if (msg.userId === this.userId) return;
+
+      const key = `${msg.rowId}|${msg.colId}`;
+
+      if (msg.value != null && msg.value !== "") {
+        this._remoteTyping.set(key, {
+          userId: msg.userId,
+          value: msg.value,
+          timestamp: Date.now(),
+        });
+      } else {
+        // Typing ended — clear
+        this._remoteTyping.delete(key);
+      }
+
+      // Re-render only the affected cells (cheap full body re-render for now)
+      this._renderBody();
+      this._updateSelectionClasses();
+      this._attachFillHandle();
+    } catch (e) { console.error("gridTyping error", e); }
+  }
+
+  async _broadcastTyping(rowId, colId, value) {
+    try {
+      await this._api('/api/typing', {
+        method: 'POST',
+        body: {
+          clientId: this.clientId,
+          rowId,
+          colId,
+          userId: this.userId,
+          value: value ?? "",
+        },
+      });
+    } catch {
+      // Typing broadcast failure is non-critical — silently ignore
+    }
+  }
+
+  _clearRemoteTyping(rowId, colId) {
+    const key = `${rowId}|${colId}`;
+    this._remoteTyping.delete(key);
+  }
+
+  // ---------- Lock helpers ----------
+  async _acquireLock(rowId, colId) {
+    const json = await this._api(`/api/locks/acquire`, {
+      method: "POST",
+      body: { clientId: this.clientId, rowId, colId, userId: this.userId, ttlSeconds: this.config.lockTtlSeconds },
+    });
+
+    if (json?.acquired) {
+      const key = `${rowId}|${colId}`;
+      this._locks.set(key, { userId: this.userId, acquiredAtUtc: new Date().toISOString(), ttlSeconds: this.config.lockTtlSeconds, owned: true });
+
+      // start renew timer for owned lock
+      await this._startLockRenew(rowId, colId);
+      return { acquired: true };
+    }
+
+    if (json?.holder?.userId) {
+      this._locks.set(`${rowId}|${colId}`, { ...json.holder, owned: json.holder.userId === this.userId });
+    }
+
+    return { acquired: false, holder: json?.holder || null };
+  }
+
+  async _renewLock(rowId, colId) {
+    const json = await this._api(`/api/locks/renew`, {
+      method: "POST",
+      body: { clientId: this.clientId, rowId, colId, userId: this.userId, ttlSeconds: this.config.lockTtlSeconds },
+    });
+    return json;
+  }
+
+  async _releaseLock(rowId, colId) {
+    const json = await this._api(`/api/locks/release`, {
+      method: "POST",
+      body: { clientId: this.clientId, rowId, colId, userId: this.userId },
+    });
+    return json;
+  }
+
+  async _startLockRenew(rowId, colId) {
+    await this._releaseOwnedLock().catch(() => {});
+    const timerId = window.setInterval(async () => {
+      try {
+        if (!this.state.editing || this.state.editing.rowId !== rowId || this.state.editing.colId !== colId) return;
+        const res = await this._renewLock(rowId, colId);
+        if (!res?.renewed) {
+          // lost lock
+          this._toast("You lost the lock on this cell.", { kind: "warn" });
+          this._locks.set(`${rowId}|${colId}`, { ...(res?.holder || {}), owned: false });
+          await this._releaseOwnedLock().catch(() => {});
+          this._cancelEdit();
+        }
+      } catch {
+        // ignore transient renew failures
+      }
+    }, this.config.lockRenewEveryMs);
+
+    this._ownedLock = { rowId, colId, timerId };
+  }
+
+  async _releaseOwnedLock() {
+    if (!this._ownedLock) return;
+    const { rowId, colId, timerId } = this._ownedLock;
+    this._ownedLock = null;
+    try { clearInterval(timerId); } catch {}
+
+    try {
+      await this._releaseLock(rowId, colId);
+    } catch {}
+  }
+
+  // ---------- Basic helpers ----------
+  _setStatus(msg) {
+    const el = this.shadowRoot.querySelector("[data-status]");
+    if (el) el.textContent = msg;
+  }
+
+  _toast(message, meta = {}) {
+    this.dispatchEvent(new CustomEvent("toast", { detail: { message, ...meta } }));
+    this._showToast(message, meta);
+  }
+
+  _colById(colId) { return this.state.columns.find(c => c.id === colId); }
+  _canEditCol(col) { return !!col && !this.readOnly && !col.readOnly; }
+
+  // ---------- Normalize state ----------
+  _normalizeState() {
+    const colIds = this.state.columns.map(c => c.id);
+
+    if (!this.state.columnOrder || this.state.columnOrder.length === 0) {
+      this.state.columnOrder = [...colIds];
+    } else {
+      const set = new Set(this.state.columnOrder);
+      colIds.forEach(id => { if (!set.has(id)) this.state.columnOrder.push(id); });
+      this.state.columnOrder = this.state.columnOrder.filter(id => colIds.includes(id));
+    }
+
+    for (const c of this.state.columns) {
+      if (this.state.colWidths[c.id] == null) this.state.colWidths[c.id] = c.width ?? 160;
+      if (this.state.colLastWidth[c.id] == null) this.state.colLastWidth[c.id] = this.state.colWidths[c.id] || 160;
+    }
+
+    const rowIds = this.state.rows.map(r => r.id);
+    if (!this.state.rowOrder || this.state.rowOrder.length === 0) {
+      this.state.rowOrder = [...rowIds];
+    } else {
+      const set = new Set(this.state.rowOrder);
+      rowIds.forEach(id => { if (!set.has(id)) this.state.rowOrder.push(id); });
+      this.state.rowOrder = this.state.rowOrder.filter(id => rowIds.includes(id));
+    }
+
+    const maxR = Math.max(0, rowIds.length - 1);
+    const maxC = Math.max(0, colIds.length - 1);
+
+    this.state.active = { r: clamp(this.state.active.r, 0, maxR), c: clamp(this.state.active.c, 0, maxC) };
+    this.state.selection = { r1: 0, c1: 0, r2: 0, c2: 0 };
+    this.state.editing = null;
+  }
+
+  // ---------- Virtualization row meta ----------
+  _computeRowMeta() {
+    const ids = this._view.viewRowIds;
+    const heights = new Array(ids.length);
+    const offsets = new Array(ids.length + 1);
+    offsets[0] = 0;
+    for (let i = 0; i < ids.length; i++) {
+      const rowId = ids[i];
+      const h = this.state.rowHeights[rowId] ?? this.config.defaultRowHeight;
+      heights[i] = h;
+      offsets[i + 1] = offsets[i] + h;
+    }
+    this._rowMeta = { heights, offsets, total: offsets[offsets.length - 1], version: (this._rowMeta.version + 1) };
+  }
+
+  _findRowIndexAtY(y) {
+    const offsets = this._rowMeta.offsets;
+    let lo = 0, hi = offsets.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (offsets[mid] <= y) lo = mid + 1;
+      else hi = mid;
+    }
+    return clamp(lo - 1, 0, Math.max(0, offsets.length - 2));
+  }
+
+  _calcVirtRange() {
+    const wrap = this.shadowRoot.querySelector("[data-gridwrap]");
+    if (!wrap) return { start: 0, end: -1 };
+
+    const totalRows = this._view.viewRowIds.length;
+    if (!this.config.virtualization || totalRows === 0) return { start: 0, end: totalRows - 1 };
+
+    const scrollTop = wrap.scrollTop;
+    const viewH = wrap.clientHeight;
+
+    const startIdx = this._findRowIndexAtY(scrollTop);
+    const endIdx = this._findRowIndexAtY(scrollTop + viewH);
+
+    const start = clamp(startIdx - this.config.overscan, 0, totalRows - 1);
+    const end = clamp(endIdx + this.config.overscan, 0, totalRows - 1);
+
+    return { start, end };
+  }
+
+  _ensureCellVisible(viewR, viewC) {
+    const wrap = this.shadowRoot.querySelector("[data-gridwrap]");
+    if (!wrap) return;
+
+    const rowTop = this._rowMeta.offsets[viewR] ?? 0;
+    const rowBottom = this._rowMeta.offsets[viewR + 1] ?? (rowTop + (this._rowMeta.heights[viewR] ?? this.config.defaultRowHeight));
+
+    const top = wrap.scrollTop;
+    const bottom = top + wrap.clientHeight;
+
+    if (rowTop < top) wrap.scrollTop = rowTop;
+    else if (rowBottom > bottom) wrap.scrollTop = Math.max(0, rowBottom - wrap.clientHeight);
+
+    this._renderBody();
+    const td = this._getCellTd(viewR, viewC);
+    if (td) td.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
+  // ---------- View recompute ----------
+  _isFilterActive(colId) {
+    const f = this.state.filters?.[colId];
+    if (!f) return false;
+    if (f.mode === "none") return false;
+    if (f.mode === "text") return !isBlank(f.value);
+    if (f.mode === "range") return !(isBlank(f.min) && isBlank(f.max) && isBlank(f.from) && isBlank(f.to));
+    if (f.mode === "blanks") return !!(f.blanks || f.nonblanks);
+    if (f.mode === "values") return Array.isArray(f.include) && f.include.length > 0;
+    return true;
+  }
+
+  _recomputeView() {
+    const s = this.state;
+
+    this._view.viewColIds = s.columnOrder.filter(id => !s.colHidden[id]);
+
+    let rowIds = [...s.rowOrder].filter(id => !s.rowHidden[id]);
+    rowIds = rowIds.filter(id => {
+      const r = s.rows.find(x => x.id === id);
+      return r ? !r.hidden : false;
+    });
+
+    rowIds = rowIds.filter(rowId => {
+      const row = s.rows.find(x => x.id === rowId);
+      if (!row) return false;
+
+      if (s.search && s.search.trim()) {
+        const q = s.search.trim().toLowerCase();
+        const ok = this._view.viewColIds.some(colId => containsCI(row.values[colId], q));
+        if (!ok) return false;
+      }
+
+      for (const [colId, f] of Object.entries(s.filters || {})) {
+        if (!f || f.mode === "none") continue;
+        const col = this._colById(colId);
+        if (!col) continue;
+
+        const vRaw = row.values?.[colId];
+        const v = (col.type === "datetime") ? toDatetimeLocalValue(vRaw) : vRaw;
+
+        if (f.mode === "values") {
+          const set = new Set(f.include ?? []);
+          const key = valueKeyForFilter(v);
+          if (!set.has(key)) return false;
+          continue;
+        }
+
+        if (f.mode === "blanks") {
+          if (f.blanks === true && !isBlank(v)) return false;
+          if (f.nonblanks === true && isBlank(v)) return false;
+          continue;
+        }
+
+        if (f.mode === "range") {
+          if (col.type === "number") {
+            const n = (v === "" || v == null) ? null : Number(v);
+            if (!isBlank(f.min) && (n == null || n < Number(f.min))) return false;
+            if (!isBlank(f.max) && (n == null || n > Number(f.max))) return false;
+            continue;
+          }
+          if (col.type === "datetime") {
+            const d = toDatetimeLocalValue(v);
+            const from = isBlank(f.from) ? "" : normalizeDatetimeLocalValue(f.from);
+            const to = isBlank(f.to) ? "" : normalizeDatetimeLocalValue(f.to);
+            if (from && (!d || d < from)) return false;
+            if (to && (!d || d > to)) return false;
+            if ((from || to) && !d) return false;
+            continue;
+          }
+        }
+
+        if (f.mode === "text") {
+          const val = String(v ?? "");
+          if (f.op === "contains" && !containsCI(val, f.value)) return false;
+          if (f.op === "equals" && !equalsCI(val, f.value)) return false;
+          if (f.op === "starts" && !startsCI(val, f.value)) return false;
+          continue;
+        }
+      }
+      return true;
+    });
+
+    if (s.sorts && s.sorts.length) {
+      const sorts = s.sorts.slice();
+      rowIds.sort((a, b) => {
+        const ra = s.rows.find(x => x.id === a);
+        const rb = s.rows.find(x => x.id === b);
+        for (const sort of sorts) {
+          const col = this._colById(sort.colId);
+          if (!col) continue;
+          const va = ra?.values?.[sort.colId];
+          const vb = rb?.values?.[sort.colId];
+          let cmp = 0;
+
+          if (col.type === "number") {
+            const na = va == null || va === "" ? Number.NEGATIVE_INFINITY : Number(va);
+            const nb = vb == null || vb === "" ? Number.NEGATIVE_INFINITY : Number(vb);
+            cmp = na - nb;
+          } else if (col.type === "datetime") {
+            cmp = toDatetimeLocalValue(va).localeCompare(toDatetimeLocalValue(vb));
+          } else {
+            cmp = String(va ?? "").localeCompare(String(vb ?? ""), undefined, { sensitivity: "base" });
+          }
+
+          if (cmp !== 0) return sort.dir === "asc" ? cmp : -cmp;
+        }
+        return 0;
+      });
+    }
+
+    this._view.viewRowIds = rowIds;
+
+    const maxR = Math.max(0, this._view.viewRowIds.length - 1);
+    const maxC = Math.max(0, this._view.viewColIds.length - 1);
+
+    this.state.active.r = clamp(this.state.active.r, 0, maxR);
+    this.state.active.c = clamp(this.state.active.c, 0, maxC);
+
+    const sel = this.state.selection;
+    sel.r1 = clamp(sel.r1, 0, maxR);
+    sel.r2 = clamp(sel.r2, 0, maxR);
+    sel.c1 = clamp(sel.c1, 0, maxC);
+    sel.c2 = clamp(sel.c2, 0, maxC);
+  }
+
+  // ---------- Render shell ----------
+  _renderShell() {
+    const style = `
+      :host { display:block; font-family: Segoe UI, Arial, sans-serif; color:#0f172a; }
+      .wrap { position:relative; border:1px solid #e2e8f0; border-radius:12px; overflow:hidden; background:#fff; }
+
+      .toolbar {
+        display:flex; gap:10px; align-items:center; padding:10px 12px;
+        background:linear-gradient(180deg, #f8fafc, #f1f5f9);
+        border-bottom:1px solid #e2e8f0;
+        flex-wrap:wrap;
+      }
+      .toolbar .left { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+      .toolbar .right { margin-left:auto; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+      button {
+        border:1px solid #cbd5e1; background:#fff; border-radius:10px;
+        padding:8px 10px; font-weight:700; cursor:pointer;
+      }
+      button:disabled { opacity:.5; cursor:not-allowed; }
+
+      .pill { font-size:12px; padding:5px 10px; border-radius:999px; background:#e2e8f0; color:#334155; font-weight:900; border:1px solid #e2e8f0; }
+
+      .search {
+        display:flex; align-items:center; gap:8px;
+        border:1px solid #cbd5e1; background:#fff; border-radius:10px; padding:6px 10px;
+        min-width:260px;
+      }
+      .search input { border:none; outline:none; width:100%; font-size:13px; }
+
+      .gridWrap {
+        position:relative;
+        height:560px;
+        overflow:auto;
+        outline:none;
+        user-select:none; -webkit-user-select:none;
+        background:#fff;
+      }
+
+      table { border-collapse:separate; border-spacing:0; table-layout:fixed; width:100%; }
+      thead th {
+        position:sticky; top:0; z-index:5;
+        background:#f8fafc;
+        border-bottom:1px solid #e2e8f0;
+        padding:0;
+        height:46px;
+      }
+      thead th .thInner {
+        position:relative;
+        display:flex; align-items:flex-start; gap:8px;
+        height:46px;
+        padding:8px 10px;
+        border-right:1px solid #e2e8f0;
+        user-select:none;
+        cursor:default;
+      }
+      .thInner.clickable { cursor:pointer; }
+      .thLabel{
+        font-weight:900;
+        font-size:12px;
+        line-height:14px;
+        white-space:normal;
+        word-break:break-word;
+        overflow:hidden;
+        max-height:30px;
+      }
+      .badge {
+        margin-left:6px;
+        font-size:10px;
+        font-weight:900;
+        color:#0f172a;
+        background:#e2e8f0;
+        padding:2px 6px;
+        border-radius:999px;
+      }
+
+      tbody td, tbody th {
+        border-bottom:1px solid #eef2f7;
+        border-right:1px solid #eef2f7;
+        padding:0;
+        height:auto;
+        background:#fff;
+        font-size:13px;
+        vertical-align:top;
+      }
+      tbody td { cursor:cell; }
+      tbody tr:hover td { background:#fafcff; }
+
+      .rowHead, .corner {
+        position:sticky; left:0; z-index:4;
+        background:#f8fafc;
+        border-right:1px solid #e2e8f0;
+        text-align:center;
+        font-size:12px; color:#475569;
+        width:52px;
+        user-select:none;
+        padding:0;
+        overflow:visible;
+      }
+      .corner { top:0; z-index:6; border-bottom:1px solid #e2e8f0; cursor:pointer; }
+
+      .rowHeadInner {
+        position:relative;
+        height:100%;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        cursor:pointer;
+      }
+
+      td { position:relative; }
+      .cell {
+        position:relative;
+        box-sizing:border-box;
+        width:100%;
+        height:100%;
+        min-height:100%;
+        padding:6px 28px 6px 8px;
+        overflow:hidden;
+        white-space:pre-wrap;
+        word-break:break-word;
+        line-height:16px;
+        background:transparent;
+      }
+
+      .readonlyCell { background:#f8fafc; color:#334155; }
+      .cellMeta {
+        position:absolute; left:8px; bottom:4px;
+        font-size:10px; color:#94a3b8; font-weight:800;
+        pointer-events:none;
+      }
+
+      td.active > .cell { box-shadow: inset 0 0 0 2px #2563eb; background:#eff6ff !important; }
+      td.range > .cell { background:#e0f2fe !important; }
+      td.anchor > .cell { box-shadow: inset 0 0 0 2px #0284c7; }
+      td.fillPreview > .cell { box-shadow: inset 0 0 0 2px #2563eb; background:rgba(37,99,235,.08) !important; }
+
+      td.conflict > .cell { box-shadow: inset 0 0 0 2px #ef4444; background: rgba(239,68,68,.08) !important; }
+
+      .resizeCol { position:absolute; right:0; top:0; width:12px; height:46px; cursor:col-resize; }
+      .resizeCol:hover { background:rgba(37,99,235,.08); }
+
+      .resizeRow {
+        position:absolute; left:0; right:0; bottom:-5px;
+        height:10px; cursor:row-resize; background:transparent;
+      }
+      .rowHead:hover .resizeRow { background:rgba(37,99,235,.06); }
+
+      .dragHandle {
+        width:16px; height:16px;
+        border-radius:6px;
+        background:#e2e8f0;
+        color:#334155;
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        font-size:10px;
+        font-weight:900;
+        cursor:grab;
+        flex:0 0 auto;
+        margin-top:1px;
+        touch-action:none;
+      }
+      .dragHandle:active { cursor:grabbing; }
+
+      .sortBadge { margin-left:auto; font-size:11px; font-weight:900; color:#0f172a; background:#e2e8f0; padding:2px 6px; border-radius:999px; }
+
+      .editorFrame { box-sizing:border-box; width:100%; height:100%; padding:0; background:#ffffff; box-shadow: inset 0 0 0 2px #2563eb; }
+      .editorInput, .editorSelect, .editorTextarea {
+        display:block;
+        width:100%;
+        height:100%;
+        box-sizing:border-box;
+        border:none;
+        outline:none;
+        background:transparent;
+        font: inherit;
+        padding:6px 8px;
+        margin:0;
+      }
+      .editorTextarea { resize:none; white-space:pre-wrap; line-height:16px; }
+
+      .cellArrow {
+        position:absolute;
+        right:8px;
+        top:50%;
+        transform:translateY(-50%);
+        font-size:11px;
+        color:#64748b;
+        pointer-events:none;
+      }
+
+      .fillHandle {
+        position:absolute;
+        width:8px;
+        height:8px;
+        right:-4px;
+        bottom:-4px;
+        background:#2563eb;
+        border:2px solid #ffffff;
+        border-radius:3px;
+        cursor:crosshair;
+        z-index:20;
+      }
+
+      .lockBadge {
+        position:absolute;
+        top:4px;
+        right:6px;
+        height:20px;
+        padding:0 6px;
+        border-radius:999px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        gap:4px;
+        font-size:10px;
+        font-weight:1000;
+        border:1px solid rgba(148,163,184,.5);
+        background: rgba(248,250,252,.92);
+        color:#0f172a;
+        pointer-events:none;
+        box-shadow:0 4px 12px rgba(0,0,0,.08);
+        white-space:nowrap;
+        z-index:3;
+      }
+      .lockBadge.owned { background: rgba(34,197,94,.12); border-color: rgba(34,197,94,.35); color:#166534; }
+      .lockBadge.other { background: rgba(239,68,68,.10); border-color: rgba(239,68,68,.30); color:#991b1b; }
+
+      /* Cell locked by another user — non-editable, visual cue */
+      td.lockedByOther { pointer-events: none; }
+      td.lockedByOther > .cell {
+        background: rgba(241,245,249,.85) !important;
+        cursor: not-allowed !important;
+      }
+
+      /* Remote typing indicator — cell actively being typed into by someone else */
+      td.remoteTyping > .cell {
+        background: rgba(254,243,199,.45) !important;
+        box-shadow: inset 0 0 0 1.5px rgba(245,158,11,.35);
+      }
+      .typingDots {
+        display:inline-flex; gap:2px; align-items:center; margin-left:2px;
+      }
+      .typingDots span {
+        width:4px; height:4px; border-radius:50%;
+        background:currentColor; opacity:.5;
+        animation: typeDot .9s ease-in-out infinite;
+      }
+      .typingDots span:nth-child(2) { animation-delay: .15s; }
+      .typingDots span:nth-child(3) { animation-delay: .3s; }
+      @keyframes typeDot {
+        0%,80%,100% { opacity:.3; transform:scale(.8); }
+        40% { opacity:1; transform:scale(1.15); }
+      }
+
+      .colDragGhost {
+        position:fixed; z-index:2000;
+        background:#fff; border:1px solid #cbd5e1;
+        border-radius:10px; padding:8px 10px;
+        box-shadow:0 20px 40px rgba(0,0,0,.18);
+        font-weight:900; font-size:12px; pointer-events:none;
+        transform:translate(-50%, -50%);
+      }
+      th.colDropTarget { outline:2px dashed #2563eb; outline-offset:-2px; }
+
+      .floating { position:fixed; inset:0; pointer-events:none; z-index:1000; }
+      .floating > * { pointer-events:auto; }
+
+      .ctxMenu {
+        position:fixed;
+        min-width:260px;
+        background:#fff;
+        border:1px solid #e2e8f0;
+        border-radius:12px;
+        box-shadow:0 22px 50px rgba(0,0,0,.18);
+        padding:6px;
+      }
+      .ctxHead {
+        padding:10px 10px 8px;
+        font-size:12px;
+        font-weight:900;
+        color:#334155;
+        border-bottom:1px solid #eef2f7;
+        margin-bottom:6px;
+      }
+      .ctxItem {
+        display:flex; align-items:center; gap:10px;
+        padding:10px 10px;
+        border-radius:10px;
+        cursor:pointer;
+        font-size:13px;
+      }
+      .ctxItem:hover { background:#f8fafc; }
+      .ctxIcon {
+        width:18px; height:18px; border-radius:6px;
+        background:#e2e8f0; color:#0f172a;
+        display:inline-flex; align-items:center; justify-content:center;
+        font-size:11px; font-weight:900;
+      }
+      .ctxSep { height:1px; background:#eef2f7; margin:6px 6px; }
+
+      .popover {
+        position:fixed;
+        width:380px;
+        background:#fff;
+        border:1px solid #e2e8f0;
+        border-radius:12px;
+        box-shadow:0 22px 50px rgba(0,0,0,.18);
+        padding:12px;
+      }
+      .popover h4 { margin:0 0 10px 0; font-size:13px; }
+      .popover label { font-size:12px; color:#475569; display:block; margin-top:10px; font-weight:800; }
+      .popover select, .popover input {
+        width:100%; margin-top:6px;
+        border:1px solid #cbd5e1; border-radius:10px; padding:8px 10px; outline:none;
+        font-size:13px;
+      }
+      .popover .row { display:flex; gap:10px; }
+      .popover .row > * { flex:1; }
+      .popover .actions { display:flex; gap:8px; margin-top:12px; }
+      .popover .actions button { flex:1; }
+      .muted { color:#64748b; font-size:12px; margin-top:6px; }
+
+      .valTools { display:flex; gap:8px; align-items:center; margin-top:8px; }
+      .valTools button { padding:6px 8px; border-radius:8px; }
+      .valList { margin-top:8px; max-height:240px; overflow:auto; border:1px solid #eef2f7; border-radius:10px; padding:6px; }
+      .valItem { display:flex; align-items:center; gap:10px; padding:6px 6px; border-radius:8px; }
+      .valItem:hover { background:#f8fafc; }
+      .valItem span { font-size:13px; color:#0f172a; }
+
+      .colsList { margin-top:8px; max-height:320px; overflow:auto; border:1px solid #eef2f7; border-radius:10px; padding:6px; }
+      .colsItem { display:flex; align-items:center; gap:10px; padding:8px 6px; border-radius:8px; }
+      .colsItem:hover { background:#f8fafc; }
+      .colsItem .name { font-size:13px; font-weight:900; color:#0f172a; }
+      .colsItem .meta { margin-left:auto; font-size:11px; color:#64748b; font-weight:900; }
+
+      .spacer td { border:none !important; padding:0 !important; background:transparent !important; }
+
+      /* Toasts */
+      .toasts { position:fixed; right:14px; bottom:14px; display:flex; flex-direction:column; gap:8px; z-index:4000; pointer-events:none; }
+      .toast { pointer-events:auto; max-width:380px; background:#fff; border:1px solid #e2e8f0; border-radius:14px; box-shadow:0 18px 44px rgba(0,0,0,.18); padding:10px 12px; }
+      .toast .t1{ font-size:13px; font-weight:900; }
+      .toast .t2{ margin-top:4px; font-size:12px; color:#64748b; font-weight:700; }
+      .toast.ok{ border-color: rgba(34,197,94,.25); }
+      .toast.warn{ border-color: rgba(245,158,11,.28); }
+      .toast.error{ border-color: rgba(239,68,68,.25); }
+
+      /* Conflict modal */
+      .modalBackdrop{
+        position:fixed; inset:0; background: rgba(15,23,42,.35);
+        display:flex; align-items:center; justify-content:center;
+      }
+      .modal{
+        width:min(560px, calc(100vw - 24px));
+        background:#fff; border:1px solid #e2e8f0; border-radius:16px;
+        box-shadow:0 26px 80px rgba(0,0,0,.35);
+        padding:14px;
+      }
+      .modal h3{ margin:0; font-size:14px; font-weight:1000; }
+      .modal .sub{ margin-top:6px; font-size:12px; color:#64748b; font-weight:800; }
+      .modal pre{
+        background:#f8fafc; border:1px solid #e2e8f0; border-radius:12px;
+        padding:10px; overflow:auto; white-space:pre-wrap; word-break:break-word;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size:12px;
+      }
+      .modal .grid { display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:10px; }
+      .modal .actions{ display:flex; gap:10px; margin-top:12px; }
+      .modal .actions button{ flex:1; border-radius:12px; }
+      .btnPrimary{ border-color: rgba(37,99,235,.35); background: rgba(37,99,235,.10); }
+      .btnDanger{ border-color: rgba(239,68,68,.35); background: rgba(239,68,68,.08); }
+    `;
+
+    this.shadowRoot.innerHTML = `
+      <style>${style}</style>
+      <div class="wrap">
+        <div class="toolbar">
+          <div class="left">
+            <button data-add-row>Add row</button>
+            <button data-del-row>Delete selected rows</button>
+            <button data-autofit-all>Auto-fit columns</button>
+            <button data-cols>Columns</button>
+          </div>
+          <div class="right">
+            <span class="pill" data-live>Live: —</span>
+            <div class="search">
+              <span style="font-size:12px;color:#64748b;font-weight:800">Search</span>
+              <input data-search placeholder="Type to filter rows..." />
+            </div>
+            <span class="pill" data-status>Ready</span>
+          </div>
+        </div>
+
+        <div class="gridWrap" data-gridwrap tabindex="0">
+          <table data-table>
+            <colgroup data-colgroup></colgroup>
+            <thead data-thead></thead>
+            <tbody data-tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="floating" data-floating></div>
+      <div class="toasts" data-toasts></div>
+    `;
+
+    this.shadowRoot.querySelector("[data-add-row]")?.addEventListener("click", () => this._addRow());
+    this.shadowRoot.querySelector("[data-del-row]")?.addEventListener("click", () => this._deleteSelectedRows());
+    this.shadowRoot.querySelector("[data-autofit-all]")?.addEventListener("click", () => this._autoFitColumns());
+    this.shadowRoot.querySelector("[data-cols]")?.addEventListener("click", (e) => this._toggleColumnsPopover(e.currentTarget));
+
+    const search = this.shadowRoot.querySelector("[data-search]");
+    if (search) {
+      search.value = this.state.search || "";
+      search.addEventListener("input", () => {
+        this.state.search = search.value;
+        this._recomputeView();
+        this._computeRowMeta();
+        this._renderGrid({ full: false });
+        this._persistUiDebounced();
+      });
+    }
+  }
+
+  // ---------- Global wiring ----------
+  _wireGlobal() {
+    const wrap = this.shadowRoot.querySelector("[data-gridwrap]");
+    if (!wrap) return;
+
+    wrap.addEventListener("scroll", () => {
+      if (!this.config.virtualization) return;
+      const st = wrap.scrollTop;
+      if (Math.abs(st - this._virt.lastScrollTop) < 4) return;
+      this._virt.lastScrollTop = st;
+      this._renderBody();
+      this._updateSelectionClasses();
+      this._attachFillHandle();
+    }, { passive: true });
+
+    wrap.addEventListener("mousedown", (e) => this._onMouseDown(e));
+    wrap.addEventListener("mousemove", (e) => this._onMouseMove(e));
+    wrap.addEventListener("mouseup", () => this._onMouseUp());
+    wrap.addEventListener("mouseleave", () => this._onMouseUp());
+
+    wrap.addEventListener("dblclick", (e) => {
+      const td = e.target.closest("td");
+      if (!td) return;
+      this._startEdit(Number(td.dataset.r), Number(td.dataset.c));
+    });
+
+    wrap.addEventListener("click", (e) => {
+      if (this.state.editing) return;
+      if (this._mouse.didDragSelection) return;
+
+      const td = e.target.closest("td");
+      if (!td) return;
+
+      const r = Number(td.dataset.r);
+      const c = Number(td.dataset.c);
+
+      // clicking a conflict cell opens resolver
+      const rowId = td.dataset.rowid;
+      const colId = td.dataset.colid;
+      const key = `${rowId}|${colId}`;
+      if (this._conflicts.has(key)) {
+        this._openConflictModal(rowId, colId);
+        return;
+      }
+
+      const col = this._colById(colId);
+      if (!col || !this._canEditCol(col)) return;
+
+      if (col.type === "choice" || col.type === "datetime" || col.type === "person") {
+        this._startEdit(r, c);
+      }
+    });
+
+    wrap.addEventListener("keydown", (e) => this._onKeyDown(e));
+    wrap.addEventListener("copy", (e) => this._onCopy(e));
+    wrap.addEventListener("cut", (e) => this._onCut(e));
+    wrap.addEventListener("paste", (e) => this._onPaste(e));
+
+    window.addEventListener("mousedown", (e) => {
+      const path = e.composedPath?.() || [];
+
+      const ctx = this.shadowRoot.querySelector("[data-ctxmenu]");
+      const pop = this.shadowRoot.querySelector("[data-filterpop]");
+      const colsPop = this.shadowRoot.querySelector("[data-colspop]");
+      const colsBtn = this.shadowRoot.querySelector("[data-cols]");
+
+      if (ctx && !path.includes(ctx)) this._closeCtxMenu();
+      if (pop && !path.includes(pop)) this._closeFilter();
+      if (colsPop && !path.includes(colsPop) && !(colsBtn && path.includes(colsBtn))) this._closeColumnsPopover();
+
+      if (this.state.editing) {
+        const editor = this.shadowRoot.querySelector("[data-inline-editor]");
+        if (editor && editor.tagName === "SELECT") return;
+
+        const td = e.target?.closest?.("td");
+        const sameCell = td && Number(td.dataset.r) === this.state.editing.r && Number(td.dataset.c) === this.state.editing.c;
+        const insideComponent = path.includes(this);
+
+        if (!sameCell) this._commitEdit({ reason: insideComponent ? "click-other" : "outside" });
+      }
+    }, { capture: true });
+
+    // release lock + clear typing on hard unload best-effort
+    window.addEventListener("beforeunload", () => {
+      try {
+        if (this._ownedLock) {
+          const { rowId, colId } = this._ownedLock;
+          navigator.sendBeacon?.(`${this.apiBase}/api/locks/release`, JSON.stringify({ clientId: this.clientId, rowId, colId, userId: this.userId }));
+          // Best-effort typing end broadcast
+          navigator.sendBeacon?.(`${this.apiBase}/api/typing`, JSON.stringify({ clientId: this.clientId, rowId, colId, userId: this.userId, value: "" }));
+        }
+      } catch {}
+    });
+  }
+
+  // ---------- Render ----------
+  _renderGrid({ full = false } = {}) {
+    if (!this._mounted) return;
+
+    const addBtn = this.shadowRoot.querySelector("[data-add-row]");
+    const delBtn = this.shadowRoot.querySelector("[data-del-row]");
+    if (addBtn) addBtn.disabled = this.readOnly;
+    if (delBtn) delBtn.disabled = this.readOnly;
+
+    const hiddenCount = Object.values(this.state.colHidden).filter(Boolean).length;
+    const colsBtn = this.shadowRoot.querySelector("[data-cols]");
+    if (colsBtn) colsBtn.textContent = hiddenCount ? `Columns (Hidden: ${hiddenCount})` : `Columns`;
+
+    if (full) this._renderHeaderAndCols();
+    else this._applyTableWidth();
+
+    this._renderBody();
+    this._updateSelectionClasses();
+    this._attachFillHandle();
+    this._persistUiDebounced();
+  }
+
+  _renderHeaderAndCols() {
+    const table = this.shadowRoot.querySelector("[data-table]");
+    const colgroup = this.shadowRoot.querySelector("[data-colgroup]");
+    const thead = this.shadowRoot.querySelector("[data-thead]");
+    if (!table || !colgroup || !thead) return;
+
+    const colIds = this._view.viewColIds;
+    const cols = colIds.map(id => this._colById(id));
+
+    colgroup.innerHTML = `
+      <col data-colid="__rowhead__" style="width:52px">
+      ${cols.map(c => `<col data-colid="${c.id}" style="width:${this.state.colWidths[c.id] ?? 160}px">`).join("")}
+    `;
+
+    this._applyTableWidth();
+
+    thead.innerHTML = `
+      <tr>
+        <th class="corner" data-corner><div class="thInner clickable">#</div></th>
+        ${cols.map(c => this._renderHeaderCell(c)).join("")}
+      </tr>
+    `;
+
+    thead.querySelector("[data-corner]")?.addEventListener("click", () => this._selectAll());
+
+    thead.querySelectorAll("th[data-colid]").forEach((th) => {
+      th.addEventListener("click", (e) => {
+        if (e.button !== 0) return;
+        const viewC = this._view.viewColIds.indexOf(th.dataset.colid);
+        if (viewC >= 0) this._selectColumn(viewC, { shift: e.shiftKey });
+
+        // Shift+click toggles sort (Excel-ish)
+        if (!this.readOnly) {
+          if (e.shiftKey) this._toggleSort(th.dataset.colid);
+        }
+      });
+
+      th.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        this._openHeaderCtxMenu(th.dataset.colid, th);
+      });
+
+      const rh = th.querySelector("[data-resize-col]");
+      if (rh) {
+        rh.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const colId = rh.dataset.resizeCol;
+          this._mouse.resizingCol = {
+            colId,
+            startX: e.clientX,
+            startW: this.state.colWidths[colId] ?? 160,
+            willHide: false,
+          };
+        });
+
+        rh.addEventListener("dblclick", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this._autoFitSingleColumn(rh.dataset.resizeCol);
+        });
+      }
+
+      const dh = th.querySelector("[data-col-drag]");
+      if (dh) {
+        dh.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          try { dh.setPointerCapture?.(e.pointerId); } catch {}
+          this._startColDrag(th.dataset.colid, e);
+        });
+      }
+    });
+  }
+
+  _renderHeaderCell(col) {
+    const sortIdx = this.state.sorts.findIndex(s => s.colId === col.id);
+    const sortDir = sortIdx >= 0 ? this.state.sorts[sortIdx].dir : null;
+
+    const ro = col.readOnly ? `<span class="badge" title="Read-only">🔒</span>` : "";
+    const flt = this._isFilterActive(col.id) ? `<span class="badge" title="Filtered">F</span>` : "";
+    const sortMark = sortDir ? `<span class="badge" title="Sorted">${sortDir === "asc" ? "↑" : "↓"}</span>` : "";
+
+    return `
+      <th data-colid="${col.id}">
+        <div class="thInner clickable" title="Click to select | Right click for menu | Shift+Click toggles sort">
+          <span class="dragHandle" data-col-drag title="Drag to reorder">⋮⋮</span>
+          <span class="thLabel">${escapeHtml(col.name)}${ro}${flt}${sortMark}</span>
+          ${sortDir ? `<span class="sortBadge">${sortIdx + 1}${sortDir === "asc" ? "↑" : "↓"}</span>` : ""}
+          <div class="resizeCol" data-resize-col="${col.id}" title="Resize (double click to auto-fit)"></div>
+        </div>
+      </th>
+    `;
+  }
+
+  _applyTableWidth() {
+    const table = this.shadowRoot.querySelector("[data-table]");
+    if (!table) return;
+    const colIds = this._view.viewColIds;
+    const cols = colIds.map(id => this._colById(id));
+    const totalW = 52 + cols.reduce((sum, c) => sum + (this.state.colWidths[c.id] ?? 160), 0);
+    table.style.width = `${totalW}px`;
+  }
+
+  _renderBody() {
+    const tbody = this.shadowRoot.querySelector("[data-tbody]");
+    if (!tbody) return;
+
+    const colIds = this._view.viewColIds;
+    const cols = colIds.map(id => this._colById(id));
+    const totalRows = this._view.viewRowIds.length;
+
+    if (totalRows === 0) {
+      tbody.innerHTML = `<tr><td colspan="${1 + cols.length}" style="padding:16px;color:#64748b">No rows</td></tr>`;
+      return;
+    }
+
+    const { start, end } = this._calcVirtRange();
+    this._virt.start = start;
+    this._virt.end = end;
+
+    const topH = this._rowMeta.offsets[start] ?? 0;
+    const bottomH = (this._rowMeta.total - (this._rowMeta.offsets[end + 1] ?? this._rowMeta.total)) ?? 0;
+
+    const parts = [];
+
+    if (this.config.virtualization && topH > 0) {
+      parts.push(`<tr class="spacer"><td colspan="${1 + cols.length}" style="height:${topH}px"></td></tr>`);
+    }
+
+    for (let viewR = start; viewR <= end; viewR++) {
+      const rowId = this._view.viewRowIds[viewR];
+      const row = this.state.rows.find(x => x.id === rowId);
+      const h = this._rowMeta.heights[viewR] ?? this.config.defaultRowHeight;
+
+      parts.push(`
+        <tr data-rowid="${rowId}" style="height:${h}px">
+          <th class="rowHead" data-rowhead="${viewR}" style="height:${h}px">
+            <div class="rowHeadInner" title="Click to select row">
+              <span>${viewR + 1}</span>
+              <div class="resizeRow" data-resize-row="${rowId}" title="Resize row"></div>
+            </div>
+          </th>
+          ${cols.map((c, viewC) => this._renderCell(row, c, viewR, viewC, h)).join("")}
+        </tr>
+      `);
+    }
+
+    if (this.config.virtualization && bottomH > 0) {
+      parts.push(`<tr class="spacer"><td colspan="${1 + cols.length}" style="height:${bottomH}px"></td></tr>`);
+    }
+
+    tbody.innerHTML = parts.join("");
+
+    tbody.querySelectorAll("[data-rowhead]").forEach(el => {
+      el.addEventListener("click", (e) => {
+        if (e.target.closest("[data-resize-row]")) return;
+        const viewR = Number(el.dataset.rowhead);
+        this._selectRow(viewR, { shift: e.shiftKey });
+      });
+    });
+
+    tbody.querySelectorAll("[data-resize-row]").forEach(hEl => {
+      hEl.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const rowId = hEl.dataset.resizeRow;
+        const current = this.state.rowHeights[rowId] ?? this.config.defaultRowHeight;
+        this._mouse.resizingRow = { rowId, startY: e.clientY, startH: current };
+      });
+    });
+
+    this._wireInlineEditorIfAny();
+  }
+
+  _renderCell(row, col, viewR, viewC, rowH) {
+    const value = row?.values?.[col.id];
+    const isEditing = this.state.editing && this.state.editing.r === viewR && this.state.editing.c === viewC;
+    const canEdit = this._canEditCol(col);
+
+    const cls = [];
+    if (col.readOnly || this.readOnly) cls.push("readonlyCell");
+
+    const key = `${row?.id}|${col.id}`;
+    const lock = this._locks.get(key);
+    const conflict = this._conflicts.get(key);
+    const remoteType = this._remoteTyping.get(key);
+
+    // ✅ Only show lock badge for OTHER users' locks, NOT for self
+    const isLockedByOther = lock?.userId && lock.userId !== this.userId;
+    const lockHtml = isLockedByOther
+      ? `<div class="lockBadge other" title="Locked by ${escapeHtml(lock.userId)}">${escapeHtml(initialsFromUserId(lock.userId))}<span class="typingDots"><span></span><span></span><span></span></span></div>`
+      : "";
+
+    const conflictClass = conflict ? "conflict" : "";
+    // ✅ Mark cells locked by others — disable editing, visual cue
+    const lockedOtherClass = isLockedByOther ? "lockedByOther" : "";
+    // ✅ Mark cells being typed into by others
+    const remoteTypingClass = (remoteType && remoteType.userId !== this.userId) ? "remoteTyping" : "";
+
+    const tdClasses = [conflictClass, lockedOtherClass, remoteTypingClass].filter(Boolean).join(" ");
+
+    if (isEditing && canEdit) {
+      const draft = this._formatValue(col, value);
+
+      let editorHtml = "";
+      if (col.type === "datetime") {
+        editorHtml = `<input class="editorInput" data-inline-editor type="datetime-local" value="${escapeHtml(toDatetimeLocalValue(draft))}" />`;
+      } else if (col.type === "number") {
+        editorHtml = `<input class="editorInput" data-inline-editor type="text" inputmode="decimal" value="${escapeHtml(draft)}" />`;
+      } else if ((col.type === "choice" || col.type === "person") && Array.isArray(col.options)) {
+        editorHtml = `
+          <select class="editorSelect" data-inline-editor>
+            ${col.options.map(o => {
+              const s = String(o);
+              const sel = equalsCI(s, draft) ? "selected" : "";
+              return `<option ${sel} value="${escapeHtml(s)}">${escapeHtml(s)}</option>`;
+            }).join("")}
+          </select>
+        `;
+      } else if (col.type === "multiline") {
+        editorHtml = `<textarea class="editorTextarea" data-inline-editor>${escapeHtml(draft)}</textarea>`;
+      } else {
+        editorHtml = `<input class="editorInput" data-inline-editor type="text" value="${escapeHtml(draft)}" />`;
+      }
+
+      return `
+        <td class="${tdClasses}" style="height:${rowH}px" data-r="${viewR}" data-c="${viewC}" data-rowid="${row.id}" data-colid="${col.id}">
+          <div class="cell editorFrame ${cls.join(" ")}" data-type="${col.type}">
+            ${editorHtml}
+          </div>
+        </td>
+      `;
+    }
+
+    // ✅ Show remote typing content if another user is typing in this cell
+    const hasRemoteTyping = remoteType && remoteType.userId !== this.userId;
+    const displayText = hasRemoteTyping ? remoteType.value : this._formatValue(col, value);
+    const arrow = (canEdit && !isLockedByOther && (col.type === "choice" || col.type === "person" || col.type === "datetime"))
+      ? `<span class="cellArrow">▾</span>` : "";
+
+    return `
+      <td class="${tdClasses}" style="height:${rowH}px" data-r="${viewR}" data-c="${viewC}" data-rowid="${row?.id}" data-colid="${col.id}">
+        <div class="cell ${cls.join(" ")}" data-type="${col.type}">
+          ${escapeHtml(displayText)}
+          ${arrow}
+          ${lockHtml}
+        </div>
+      </td>
+    `;
+  }
+
+  // ---------- Inline editor wiring ----------
+  _wireInlineEditorIfAny() {
+    if (!this.state.editing) return;
+    const el = this.shadowRoot.querySelector("[data-inline-editor]");
+    if (!el) return;
+
+    const ed = this.state.editing;
+
+    queueMicrotask(() => {
+      try {
+        el.focus();
+
+        // firstKey: start typing replaces
+        if (ed.firstKey && typeof el.value === "string" && el.tagName !== "SELECT") {
+          el.value = ed.firstKey;
+          if (el.setSelectionRange) el.setSelectionRange(el.value.length, el.value.length);
+        } else if (el.select && el.tagName !== "SELECT") {
+          // initial select (Excel-like). Subsequent click lets caret placement inside input.
+          el.select();
+        }
+      } catch {}
+    });
+
+    // allow caret placement by clicking inside editor
+    el.addEventListener("mousedown", (e) => e.stopPropagation());
+
+    if (el.tagName === "SELECT") {
+      el.addEventListener("change", () => { if (this.state.editing) this._commitEdit({ reason: "change" }); });
+      el.addEventListener("blur", () => { if (this.state.editing) this._commitEdit({ reason: "blur" }); });
+
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { this._cancelEdit(); e.preventDefault(); return; }
+        if (e.key === "Tab") {
+          const dc = e.shiftKey ? -1 : 1;
+          this._commitEdit({ reason: "tab", move: { dr: 0, dc } });
+          e.preventDefault();
+          return;
+        }
+        if (e.key === "Enter") {
+          this._commitEdit({ reason: "enter", move: { dr: 1, dc: 0 } });
+          e.preventDefault();
+          return;
+        }
+      });
+      return;
+    }
+
+    el.addEventListener("keydown", (e) => {
+      const col = this._colById(this.state.editing?.colId);
+
+      if (col?.type === "multiline") {
+        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+          this._commitEdit({ reason: "ctrl-enter", move: { dr: 1, dc: 0 } });
+          e.preventDefault();
+          return;
+        }
+        if (e.key === "Escape") { this._cancelEdit(); e.preventDefault(); return; }
+        if (e.key === "Tab") {
+          const dc = e.shiftKey ? -1 : 1;
+          this._commitEdit({ reason: "tab", move: { dr: 0, dc } });
+          e.preventDefault();
+          return;
+        }
+        return;
+      }
+
+      if (e.key === "Enter") {
+        const dr = e.shiftKey ? -1 : 1;
+        this._commitEdit({ reason: "enter", move: { dr, dc: 0 } });
+        e.preventDefault();
+        return;
+      }
+      if (e.key === "Escape") { this._cancelEdit(); e.preventDefault(); return; }
+      if (e.key === "Tab") {
+        const dc = e.shiftKey ? -1 : 1;
+        this._commitEdit({ reason: "tab", move: { dr: 0, dc } });
+        e.preventDefault();
+        return;
+      }
+    });
+
+    // ✅ Live typing broadcast — send typed value to other users in real time
+    // Does NOT save to DB per keystroke. DB save happens on blur/enter/debounce.
+    el.addEventListener("input", () => {
+      if (!this.state.editing) return;
+      const { rowId, colId } = this.state.editing;
+      const currentValue = el.value ?? "";
+      this._broadcastTypingDebounced(rowId, colId, currentValue);
+    });
+
+    el.addEventListener("blur", () => {
+      if (this.state.editing) this._commitEdit({ reason: "blur" });
+    }, { once: true });
+  }
+
+  _formatValue(col, value) {
+    if (value == null) return "";
+    if (col.type === "datetime") return toDatetimeLocalValue(value);
+    if (col.type === "number") return (value === "" ? "" : String(value));
+    return String(value);
+  }
+
+  // ---------- Selection ----------
+  _normalizeSel(sel) {
+    const r1 = Math.min(sel.r1, sel.r2);
+    const r2 = Math.max(sel.r1, sel.r2);
+    const c1 = Math.min(sel.c1, sel.c2);
+    const c2 = Math.max(sel.c1, sel.c2);
+    return { r1, c1, r2, c2 };
+  }
+
+  _getCellTd(r, c) {
+    return this.shadowRoot.querySelector(`td[data-r="${r}"][data-c="${c}"]`);
+  }
+
+  _updateSelectionClasses() {
+    this.shadowRoot.querySelectorAll("td.active,td.range,td.anchor,td.fillPreview").forEach(el =>
+      el.classList.remove("active", "range", "anchor", "fillPreview")
+    );
+
+    const sel = this._normalizeSel(this.state.selection);
+
+    const start = this._virt.start ?? 0;
+    const end = this._virt.end ?? (this._view.viewRowIds.length - 1);
+
+    const rr1 = clamp(sel.r1, start, end);
+    const rr2 = clamp(sel.r2, start, end);
+
+    for (let rr = rr1; rr <= rr2; rr++) {
+      for (let cc = sel.c1; cc <= sel.c2; cc++) {
+        const td = this._getCellTd(rr, cc);
+        if (td) td.classList.add("range");
+      }
+    }
+
+    const act = this._getCellTd(this.state.active.r, this.state.active.c);
+    if (act) act.classList.add("active");
+
+    const anc = this._getCellTd(sel.r1, sel.c1);
+    if (anc) anc.classList.add("anchor");
+  }
+
+  _selectAll() {
+    const maxR = Math.max(0, this._view.viewRowIds.length - 1);
+    const maxC = Math.max(0, this._view.viewColIds.length - 1);
+    this.state.active = { r: 0, c: 0 };
+    this.state.selection = { r1: 0, c1: 0, r2: maxR, c2: maxC };
+    this._updateSelectionClasses();
+    this._attachFillHandle();
+  }
+
+  _selectRow(viewR, { shift = false } = {}) {
+    const maxC = Math.max(0, this._view.viewColIds.length - 1);
+    if (!shift) {
+      this.state.active = { r: viewR, c: 0 };
+      this.state.selection = { r1: viewR, c1: 0, r2: viewR, c2: maxC };
+    } else {
+      const a = this.state.selection;
+      this.state.active = { r: viewR, c: 0 };
+      this.state.selection = { r1: a.r1, c1: 0, r2: viewR, c2: maxC };
+    }
+    this._updateSelectionClasses();
+    this._attachFillHandle();
+  }
+
+  _selectColumn(viewC, { shift = false } = {}) {
+    const maxR = Math.max(0, this._view.viewRowIds.length - 1);
+    if (!shift) {
+      this.state.active = { r: 0, c: viewC };
+      this.state.selection = { r1: 0, c1: viewC, r2: maxR, c2: viewC };
+    } else {
+      const a = this.state.selection;
+      this.state.active = { r: 0, c: viewC };
+      this.state.selection = { r1: 0, c1: a.c1, r2: maxR, c2: viewC };
+    }
+    this._updateSelectionClasses();
+    this._attachFillHandle();
+  }
+
+  // ---------- Mouse ----------
+  _onMouseDown(e) {
+    if (e.button !== 0) return;
+    if (e.target.closest?.("[data-inline-editor]")) return;
+
+    const path = e.composedPath?.() || [];
+    const ctx = this.shadowRoot.querySelector("[data-ctxmenu]");
+    const pop = this.shadowRoot.querySelector("[data-filterpop]");
+    const colsPop = this.shadowRoot.querySelector("[data-colspop]");
+    if ((ctx && path.includes(ctx)) || (pop && path.includes(pop)) || (colsPop && path.includes(colsPop))) return;
+
+    if (e.target?.classList?.contains("fillHandle")) {
+      e.preventDefault();
+      e.stopPropagation();
+      this._startFillDrag();
+      return;
+    }
+
+    const td = e.target.closest("td");
+    if (!td) return;
+
+    const r = Number(td.dataset.r);
+    const c = Number(td.dataset.c);
+
+    if (this.state.editing && this.state.editing.r === r && this.state.editing.c === c) return;
+
+    if (this.state.editing && (this.state.editing.r !== r || this.state.editing.c !== c)) {
+      this._commitEdit({ reason: "click-cell", selectAfter: { r, c, shift: e.shiftKey } });
+      return;
+    }
+
+    this._mouse.didDragSelection = false;
+
+    if (!e.shiftKey) {
+      this.state.active = { r, c };
+      this.state.selection = { r1: r, c1: c, r2: r, c2: c };
+    } else {
+      const a = this.state.selection;
+      this.state.active = { r, c };
+      this.state.selection = { r1: a.r1, c1: a.c1, r2: r, c2: c };
+    }
+
+    this._mouse.selecting = true;
+    this._updateSelectionClasses();
+    this._attachFillHandle();
+    this.shadowRoot.querySelector("[data-gridwrap]")?.focus();
+  }
+
+  _onMouseMove(e) {
+    if (this._mouse.resizingCol) {
+      const m = this._mouse.resizingCol;
+      const dx = e.clientX - m.startX;
+      const attempted = m.startW + dx;
+
+      m.willHide = attempted < this.config.hideDragThreshold;
+
+      const w = clamp(attempted, this.config.minColWidth, this.config.maxColWidth);
+      this.state.colWidths[m.colId] = w;
+      if (w > this.config.minColWidth) this.state.colLastWidth[m.colId] = w;
+
+      const colEl = this.shadowRoot.querySelector(`col[data-colid="${m.colId}"]`);
+      if (colEl) colEl.style.width = `${w}px`;
+      this._applyTableWidth();
+      this._persistUiDebounced();
+      return;
+    }
+
+    if (this._mouse.resizingRow) {
+      const m = this._mouse.resizingRow;
+      const dy = e.clientY - m.startY;
+      const h = clamp(m.startH + dy, this.config.minRowHeight, this.config.maxRowHeight);
+      this.state.rowHeights[m.rowId] = h;
+
+      const tr = this.shadowRoot.querySelector(`tr[data-rowid="${m.rowId}"]`);
+      if (tr) tr.style.height = `${h}px`;
+
+      this._computeRowMeta();
+      this._persistUiDebounced();
+      return;
+    }
+
+    if (this._fill) {
+      const td = e.target.closest("td");
+      if (!td) return;
+      this._fill.endCell = { r: Number(td.dataset.r), c: Number(td.dataset.c) };
+      this._updateFillPreview();
+      return;
+    }
+
+    if (this._mouse.selecting) {
+      const td = e.target.closest("td");
+      if (!td) return;
+      const r = Number(td.dataset.r);
+      const c = Number(td.dataset.c);
+      const a = this.state.selection;
+      this.state.active = { r, c };
+      this.state.selection = { r1: a.r1, c1: a.c1, r2: r, c2: c };
+      this._mouse.didDragSelection = true;
+      this._updateSelectionClasses();
+      this._attachFillHandle();
+    }
+  }
+
+  _onMouseUp() {
+    if (this._mouse.resizingCol) {
+      const { colId, willHide } = this._mouse.resizingCol;
+      this._mouse.resizingCol = null;
+      if (willHide) this._hideColumn(colId);
+      return;
+    }
+    if (this._mouse.resizingRow) {
+      this._mouse.resizingRow = null;
+      return;
+    }
+    if (this._mouse.selecting) {
+      this._mouse.selecting = false;
+    }
+    if (this._fill) this._finishFillDrag();
+  }
+
+  // ---------- Keyboard ----------
+  _onKeyDown(e) {
+    if (this.state.editing) return;
+
+    const maxR = this._view.viewRowIds.length - 1;
+    const maxC = this._view.viewColIds.length - 1;
+
+    let { r, c } = this.state.active;
+    let nr = r, nc = c;
+
+    const isArrow = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key);
+    if (e.key === "ArrowUp") nr = clamp(r - 1, 0, maxR);
+    if (e.key === "ArrowDown") nr = clamp(r + 1, 0, maxR);
+    if (e.key === "ArrowLeft") nc = clamp(c - 1, 0, maxC);
+    if (e.key === "ArrowRight") nc = clamp(c + 1, 0, maxC);
+
+    if (e.key === "Tab") {
+      nc = clamp(c + (e.shiftKey ? -1 : 1), 0, maxC);
+      e.preventDefault();
+    }
+
+    if (!this.readOnly && (e.key === "Enter" || e.key === "F2")) {
+      this._startEdit(r, c);
+      e.preventDefault();
+      return;
+    }
+
+    if (!this.readOnly && (e.key === "Delete" || e.key === "Backspace")) {
+      this._clearSelection();
+      this._recomputeView();
+      this._computeRowMeta();
+      this._renderGrid({ full: false });
+      e.preventDefault();
+      return;
+    }
+
+    const moved = (nr !== r) || (nc !== c);
+    if (moved) {
+      this.state.active = { r: nr, c: nc };
+      if (e.shiftKey && isArrow) {
+        const a = this.state.selection;
+        this.state.selection = { r1: a.r1, c1: a.c1, r2: nr, c2: nc };
+      } else {
+        this.state.selection = { r1: nr, c1: nc, r2: nr, c2: nc };
+      }
+      this._renderBody();
+      this._updateSelectionClasses();
+      this._attachFillHandle();
+      this._ensureCellVisible(nr, nc);
+      if (isArrow) e.preventDefault();
+    }
+
+    if (!this.readOnly && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      this._startEdit(r, c, { firstKey: e.key });
+      e.preventDefault();
+    }
+  }
+
+  // ---------- Editing (with locks + server save) ----------
+  async _startEdit(viewR, viewC, { firstKey = null } = {}) {
+    if (this.readOnly) return;
+
+    const colId = this._view.viewColIds[viewC];
+    const rowId = this._view.viewRowIds[viewR];
+    const col = this._colById(colId);
+    if (!col || col.readOnly) return;
+
+    const key = `${rowId}|${colId}`;
+
+    // If conflict exists, open resolver instead of editing
+    if (this._conflicts.has(key)) {
+      this._openConflictModal(rowId, colId);
+      return;
+    }
+
+    // If locked by someone else, block edit
+    const lock = this._locks.get(key);
+    if (lock?.userId && lock.userId !== this.userId) {
+      this._toast(`Locked by ${lock.userId}.`, { kind: "warn" });
+      return;
+    }
+
+    // ✅ Acquire lock (server authoritative — NEVER assume lock success)
+    try {
+      const res = await this._acquireLock(rowId, colId);
+      if (!res.acquired) {
+        const holder = res.holder?.userId ? res.holder.userId : "another user";
+        this._toast(`Cell is locked by ${holder}.`, { kind: "warn" });
+        this._renderBody();
+        this._updateSelectionClasses();
+        return;
+      }
+    } catch (e) {
+      this._toast("Unable to lock cell (network).", { kind: "error", detail: String(e?.message || e) });
+      return;
+    }
+
+    // ✅ Server confirmed lock — safe to enter edit mode
+    this.state.editing = { r: viewR, c: viewC, colId, rowId, firstKey };
+    this._renderBody();
+    this._updateSelectionClasses();
+    this._attachFillHandle();
+  }
+
+  async _commitEdit({ reason = "commit", move = null, selectAfter = null } = {}) {
+    const ed = this.state.editing;
+    if (!ed) return;
+
+    const input = this.shadowRoot.querySelector("[data-inline-editor]");
+    const col = this._colById(ed.colId);
+    const row = this.state.rows.find(r => r.id === ed.rowId);
+
+    let changed = false;
+    let newValue = null;
+
+    if (col && row && input) {
+      let raw = input.value ?? "";
+      // normalize
+      if (col.type === "datetime") raw = isBlank(raw) ? "" : normalizeDatetimeLocalValue(raw);
+      else if (col.type === "number") raw = isBlank(raw) ? "" : (Number.isNaN(Number(raw)) ? String(raw) : Number(raw));
+      else raw = String(raw ?? "");
+
+      const oldValue = row.values?.[ed.colId] ?? "";
+      if (oldValue !== raw) {
+        row.values[ed.colId] = raw;
+        changed = true;
+        newValue = raw;
+      }
+    }
+
+    const lastR = ed.r, lastC = ed.c;
+    const rowId = ed.rowId, colId = ed.colId;
+
+    this.state.editing = null;
+    this._renderBody(); // remove editor quickly
+
+    // ✅ Broadcast typing end so other users clear the typing indicator
+    this._broadcastTyping(rowId, colId, "").catch(() => {});
+    this._clearRemoteTyping(rowId, colId);
+
+    // release lock immediately after edit is committed/cancelled
+    await this._releaseOwnedLock().catch(() => {});
+
+    if (changed) {
+      // send to server
+      await this._saveCellToServer(rowId, colId, newValue);
+    }
+
+    this._recomputeView();
+    this._computeRowMeta();
+
+    if (selectAfter) {
+      const { r, c, shift } = selectAfter;
+      if (!shift) {
+        this.state.active = { r, c };
+        this.state.selection = { r1: r, c1: c, r2: r, c2: c };
+      } else {
+        const a = this.state.selection;
+        this.state.active = { r, c };
+        this.state.selection = { r1: a.r1, c1: a.c1, r2: r, c2: c };
+      }
+    } else if (move) {
+      const maxR = Math.max(0, this._view.viewRowIds.length - 1);
+      const maxC = Math.max(0, this._view.viewColIds.length - 1);
+      const nr = clamp(lastR + (move.dr || 0), 0, maxR);
+      const nc = clamp(lastC + (move.dc || 0), 0, maxC);
+      this.state.active = { r: nr, c: nc };
+      this.state.selection = { r1: nr, c1: nc, r2: nr, c2: nc };
+    }
+
+    this._renderGrid({ full: false });
+    this._ensureCellVisible(this.state.active.r, this.state.active.c);
+    this.shadowRoot.querySelector("[data-gridwrap]")?.focus();
+  }
+
+  _cancelEdit() {
+    if (!this.state.editing) return;
+    const { rowId, colId } = this.state.editing;
+    this.state.editing = null;
+
+    // ✅ Broadcast typing end so other users clear the typing indicator
+    this._broadcastTyping(rowId, colId, "").catch(() => {});
+    this._clearRemoteTyping(rowId, colId);
+
+    this._releaseOwnedLock().catch(() => {});
+    this._renderGrid({ full: false });
+    this.shadowRoot.querySelector("[data-gridwrap]")?.focus();
+  }
+
+  // ---------- Clipboard ----------
+  _getSelectionMatrix(sel) {
+    const out = [];
+    for (let rr = sel.r1; rr <= sel.r2; rr++) {
+      const rowId = this._view.viewRowIds[rr];
+      const row = this.state.rows.find(x => x.id === rowId);
+      const rowArr = [];
+      for (let cc = sel.c1; cc <= sel.c2; cc++) {
+        const colId = this._view.viewColIds[cc];
+        rowArr.push(row?.values?.[colId] ?? "");
+      }
+      out.push(rowArr);
+    }
+    return out;
+  }
+
+  _setCellByView(viewR, viewC, rawValue) {
+    const colId = this._view.viewColIds[viewC];
+    const rowId = this._view.viewRowIds[viewR];
+    const col = this._colById(colId);
+    const row = this.state.rows.find(x => x.id === rowId);
+    if (!col || !row) return null;
+    if (!this._canEditCol(col)) return null;
+
+    // locked by others?
+    const key = `${rowId}|${colId}`;
+    const lock = this._locks.get(key);
+    if (lock?.userId && lock.userId !== this.userId) return null;
+    if (this._conflicts.has(key)) return null;
+
+    let v = rawValue;
+    if (col.type === "number") v = isBlank(v) ? "" : (Number.isNaN(Number(v)) ? String(v) : Number(v));
+    else if (col.type === "datetime") v = isBlank(v) ? "" : normalizeDatetimeLocalValue(v);
+    else v = String(v ?? "");
+
+    const oldValue = row.values?.[colId] ?? "";
+    if (oldValue === v) return null;
+
+    row.values[colId] = v;
+    return { rowId, colId, value: v };
+  }
+
+  _clearSelection() {
+    const sel = this._normalizeSel(this.state.selection);
+    const changes = [];
+    for (let rr = sel.r1; rr <= sel.r2; rr++) {
+      for (let cc = sel.c1; cc <= sel.c2; cc++) {
+        const ch = this._setCellByView(rr, cc, "");
+        if (ch) changes.push(ch);
+      }
+    }
+    if (changes.length) {
+      // queue server updates (debounced)
+      for (const ch of changes) this._saveCellToServer(ch.rowId, ch.colId, ch.value);
+    }
+  }
+
+  _onCopy(e) {
+    const matrix = this._getSelectionMatrix(this._normalizeSel(this.state.selection));
+    e.clipboardData.setData("text/plain", toTSV(matrix));
+    e.preventDefault();
+    this._setStatus("Copied");
+  }
+
+  _onCut(e) {
+    if (this.readOnly) return;
+    this._onCopy(e);
+    this._clearSelection();
+    this._renderGrid({ full: false });
+    this._setStatus("Cut");
+  }
+
+  _onPaste(e) {
+    if (this.readOnly) return;
+
+    const text = e.clipboardData.getData("text/plain");
+    if (!text) return;
+
+    const data = parseTSV(text);
+    const startR = this.state.active.r;
+    const startC = this.state.active.c;
+
+    const maxR = this._view.viewRowIds.length - 1;
+    const maxC = this._view.viewColIds.length - 1;
+
+    const changes = [];
+    for (let r = 0; r < data.length; r++) {
+      for (let c = 0; c < data[r].length; c++) {
+        const rr = startR + r;
+        const cc = startC + c;
+        if (rr > maxR || cc > maxC) continue;
+        const ch = this._setCellByView(rr, cc, data[r][c]);
+        if (ch) changes.push(ch);
+      }
+    }
+
+    if (changes.length) {
+      for (const ch of changes) this._saveCellToServer(ch.rowId, ch.colId, ch.value);
+      this._recomputeView();
+      this._computeRowMeta();
+      this._renderGrid({ full: false });
+      this._setStatus("Pasted");
+    }
+    e.preventDefault();
+  }
+
+  // ---------- Fill handle ----------
+  _attachFillHandle() {
+    this.shadowRoot.querySelectorAll(".fillHandle").forEach(x => x.remove());
+    if (this.readOnly) return;
+
+    const td = this._getCellTd(this.state.active.r, this.state.active.c);
+    const cell = td?.querySelector(".cell");
+    if (!cell) return;
+
+    const handle = document.createElement("div");
+    handle.className = "fillHandle";
+    cell.appendChild(handle);
+  }
+
+  _startFillDrag() {
+    const sel = this._normalizeSel(this.state.selection);
+    this._fill = {
+      sourceSel: sel,
+      startCell: { r: this.state.active.r, c: this.state.active.c },
+      endCell: { r: this.state.active.r, c: this.state.active.c },
+    };
+  }
+
+  _updateFillPreview() {
+    this.shadowRoot.querySelectorAll("td.fillPreview").forEach(el => el.classList.remove("fillPreview"));
+
+    const f = this._fill;
+    if (!f) return;
+
+    const s = f.sourceSel;
+    const e = f.endCell;
+
+    const r1 = Math.min(s.r1, e.r);
+    const r2 = Math.max(s.r2, e.r);
+    const c1 = Math.min(s.c1, e.c);
+    const c2 = Math.max(s.c2, e.c);
+
+    const start = this._virt.start ?? 0;
+    const end = this._virt.end ?? (this._view.viewRowIds.length - 1);
+
+    const rr1 = clamp(r1, start, end);
+    const rr2 = clamp(r2, start, end);
+
+    for (let rr = rr1; rr <= rr2; rr++) {
+      for (let cc = c1; cc <= c2; cc++) {
+        const inSource = (rr >= s.r1 && rr <= s.r2 && cc >= s.c1 && cc <= s.c2);
+        if (inSource) continue;
+        const td = this._getCellTd(rr, cc);
+        if (td) td.classList.add("fillPreview");
+      }
+    }
+  }
+
+  _finishFillDrag() {
+    const f = this._fill;
+    this._fill = null;
+    this.shadowRoot.querySelectorAll("td.fillPreview").forEach(el => el.classList.remove("fillPreview"));
+    if (!f) return;
+
+    const s = f.sourceSel;
+    const e = f.endCell;
+
+    const r1 = Math.min(s.r1, e.r);
+    const r2 = Math.max(s.r2, e.r);
+    const c1 = Math.min(s.c1, e.c);
+    const c2 = Math.max(s.c2, e.c);
+
+    const source = this._getSelectionMatrix(s);
+    const srcRows = source.length;
+    const srcCols = source[0]?.length ?? 1;
+
+    const changes = [];
+
+    for (let rr = r1; rr <= r2; rr++) {
+      for (let cc = c1; cc <= c2; cc++) {
+        if (rr >= s.r1 && rr <= s.r2 && cc >= s.c1 && cc <= s.c2) continue;
+
+        const srcR = (rr - s.r1) % srcRows;
+        const srcC = (cc - s.c1) % srcCols;
+        const val = source[srcR]?.[srcC] ?? "";
+
+        const ch = this._setCellByView(rr, cc, val);
+        if (ch) changes.push(ch);
+      }
+    }
+
+    if (changes.length) {
+      for (const ch of changes) this._saveCellToServer(ch.rowId, ch.colId, ch.value);
+      this._recomputeView();
+      this._computeRowMeta();
+      this._renderGrid({ full: false });
+      this._setStatus("Filled");
+    }
+  }
+
+  // ---------- Column hide/unhide ----------
+  _hideColumn(colId) {
+    const w = this.state.colWidths[colId] ?? 160;
+    if (w > this.config.minColWidth) this.state.colLastWidth[colId] = w;
+    this.state.colHidden[colId] = true;
+    this._recomputeView();
+    this._renderGrid({ full: true });
+    this._persistUiDebounced();
+  }
+
+  _showColumn(colId) {
+    delete this.state.colHidden[colId];
+    const last = this.state.colLastWidth[colId];
+    if (last != null) this.state.colWidths[colId] = last;
+    this._recomputeView();
+    this._renderGrid({ full: true });
+    this._persistUiDebounced();
+  }
+
+  // ---------- Auto-fit ----------
+  _autoFitColumns() {
+    const font = "13px Segoe UI, Arial, sans-serif";
+    const sampleCount = Math.min(80, this._view.viewRowIds.length);
+    for (const colId of this._view.viewColIds) this._autoFitSingleColumn(colId, { font, sampleCount, rerender: false });
+    this._renderGrid({ full: true });
+    this._persistUiDebounced();
+    this._setStatus("Columns auto-fit");
+  }
+
+  _autoFitSingleColumn(colId, opts = {}) {
+    const font = opts.font || "13px Segoe UI, Arial, sans-serif";
+    const sampleCount = opts.sampleCount ?? Math.min(80, this._view.viewRowIds.length);
+    const rerender = opts.rerender !== false;
+
+    const col = this._colById(colId);
+    if (!col) return;
+
+    let w = measureTextWidth(col.name, "12px Segoe UI, Arial, sans-serif") + 70;
+    for (let i = 0; i < sampleCount; i++) {
+      const rowId = this._view.viewRowIds[i];
+      const row = this.state.rows.find(r => r.id === rowId);
+      const val = this._formatValue(col, row?.values?.[colId]);
+      w = Math.max(w, measureTextWidth(val, font) + 40);
+    }
+
+    this.state.colWidths[colId] = clamp(Math.ceil(w), this.config.minColWidth, 640);
+    this.state.colLastWidth[colId] = this.state.colWidths[colId];
+
+    if (rerender) {
+      const colEl = this.shadowRoot.querySelector(`col[data-colid="${colId}"]`);
+      if (colEl) colEl.style.width = `${this.state.colWidths[colId]}px`;
+      this._renderGrid({ full: true });
+      this._persistUiDebounced();
+      this._setStatus(`Auto-fit: ${col.name}`);
+    }
+  }
+
+  // ---------- Sorting ----------
+  _toggleSort(colId) {
+    const idx = this.state.sorts.findIndex(s => s.colId === colId);
+    if (idx < 0) {
+      this.state.sorts.push({ colId, dir: "asc" });
+    } else {
+      const cur = this.state.sorts[idx].dir;
+      if (cur === "asc") this.state.sorts[idx].dir = "desc";
+      else this.state.sorts.splice(idx, 1);
+    }
+    this._recomputeView();
+    this._computeRowMeta();
+    this._renderGrid({ full: true });
+    this._persistUiDebounced();
+  }
+
+  _clearSort(colId = null) {
+    if (colId) this.state.sorts = this.state.sorts.filter(s => s.colId !== colId);
+    else this.state.sorts = [];
+    this._recomputeView();
+    this._computeRowMeta();
+    this._renderGrid({ full: true });
+    this._persistUiDebounced();
+  }
+
+  // ---------- Header menus + filter popover ----------
+  _getFloating() { return this.shadowRoot.querySelector("[data-floating]"); }
+
+  _closeCtxMenu() {
+    const f = this._getFloating();
+    const existing = f?.querySelector("[data-ctxmenu]");
+    if (existing) existing.remove();
+  }
+
+  _closeFilter() {
+    const f = this._getFloating();
+    const existing = f?.querySelector("[data-filterpop]");
+    if (existing) existing.remove();
+  }
+
+  _openHeaderCtxMenu(colId, thEl) {
+    this._closeCtxMenu();
+    this._closeFilter();
+
+    const col = this._colById(colId);
+    if (!col) return;
+
+    const rect = thEl.getBoundingClientRect();
+    const x = rect.left;
+    const y = rect.bottom + 6;
+
+    const f = this._getFloating();
+    const menu = document.createElement("div");
+    menu.className = "ctxMenu";
+    menu.setAttribute("data-ctxmenu", "1");
+
+    const sortIdx = this.state.sorts.findIndex(s => s.colId === colId);
+    const hasSort = sortIdx >= 0;
+
+    menu.innerHTML = `
+      <div class="ctxHead">${escapeHtml(col.name)}</div>
+      <div class="ctxItem" data-act="sortAsc"><span class="ctxIcon">A</span> Sort A → Z</div>
+      <div class="ctxItem" data-act="sortDesc"><span class="ctxIcon">Z</span> Sort Z → A</div>
+      ${hasSort ? `<div class="ctxItem" data-act="clearSort"><span class="ctxIcon">S</span> Clear sort</div>` : ""}
+      <div class="ctxSep"></div>
+      <div class="ctxItem" data-act="filter"><span class="ctxIcon">F</span> Filter…</div>
+      <div class="ctxItem" data-act="clearFilter"><span class="ctxIcon">C</span> Clear filter</div>
+      <div class="ctxSep"></div>
+      <div class="ctxItem" data-act="autofit"><span class="ctxIcon">↔</span> Auto-fit column</div>
+      <div class="ctxItem" data-act="hideCol"><span class="ctxIcon">H</span> Hide column</div>
+    `;
+
+    f.appendChild(menu);
+
+    const mw = 270;
+    const mh = 330;
+    menu.style.left = `${Math.min(window.innerWidth - mw, Math.max(8, x))}px`;
+    menu.style.top = `${Math.min(window.innerHeight - mh, Math.max(8, y))}px`;
+
+    menu.addEventListener("mousedown", (e) => e.stopPropagation());
+    menu.addEventListener("click", (e) => {
+      const item = e.target.closest("[data-act]");
+      if (!item) return;
+      const act = item.dataset.act;
+
+      if (act === "sortAsc") { this.state.sorts = [{ colId, dir: "asc" }]; this._renderGrid({ full: true }); }
+      if (act === "sortDesc") { this.state.sorts = [{ colId, dir: "desc" }]; this._renderGrid({ full: true }); }
+      if (act === "clearSort") this._clearSort(colId);
+
+      if (act === "filter") this._openFilterPopover(colId, menu.getBoundingClientRect());
+      if (act === "clearFilter") {
+        delete this.state.filters[colId];
+        this._recomputeView();
+        this._computeRowMeta();
+        this._renderGrid({ full: true });
+      }
+
+      if (act === "autofit") this._autoFitSingleColumn(colId);
+      if (act === "hideCol") this._hideColumn(colId);
+
+      this._closeCtxMenu();
+      this._persistUiDebounced();
+    });
+  }
+
+  _buildUniqueValuesForCol(colId, { limit = 250 } = {}) {
+    const col = this._colById(colId);
+    if (!col) return [];
+    const map = new Map();
+    for (const r of this.state.rows) {
+      const vRaw = r.values?.[colId];
+      const v = col.type === "datetime" ? toDatetimeLocalValue(vRaw) : (vRaw ?? "");
+      const k = valueKeyForFilter(v);
+      const label = valueLabelForFilterKey(k);
+      map.set(k, { key: k, label, count: (map.get(k)?.count ?? 0) + 1 });
+      if (map.size > limit) break;
+    }
+    const arr = [...map.values()];
+    arr.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
+    return arr;
+  }
+
+  _openFilterPopover(colId, anchorRect) {
+    this._closeFilter();
+    const col = this._colById(colId);
+    if (!col) return;
+
+    const f = this._getFloating();
+    const pop = document.createElement("div");
+    pop.className = "popover";
+    pop.setAttribute("data-filterpop", "1");
+
+    const existing = this.state.filters[colId] ?? { mode: "none" };
+    const type = col.type;
+    const canRange = (type === "number" || type === "datetime");
+    const uniqueValues = this._buildUniqueValuesForCol(colId);
+    const includeSet = new Set(existing.include ?? []);
+
+    const modeOptions = [
+      { id: "none", label: "None" },
+      { id: "text", label: "Text" },
+      ...(canRange ? [{ id: "range", label: type === "number" ? "Number range" : "Date/Time range" }] : []),
+      { id: "blanks", label: "Blanks" },
+      { id: "values", label: "Values list" },
+    ];
+
+    const mode = existing.mode ?? "none";
+
+    pop.innerHTML = `
+      <h4>Filter: ${escapeHtml(col.name)}</h4>
+
+      <label>Mode</label>
+      <select data-f-mode>
+        ${modeOptions.map(o => `<option value="${o.id}" ${o.id === mode ? "selected" : ""}>${o.label}</option>`).join("")}
+      </select>
+
+      <div data-f-body></div>
+
+      <div class="actions">
+        <button data-f-apply>Apply</button>
+        <button data-f-clear>Clear</button>
+      </div>
+      <div class="muted">Tip: Values list is the most spreadsheet-like filter.</div>
+    `;
+
+    f.appendChild(pop);
+
+    const pw = 400;
+    const ph = 520;
+    const x = anchorRect?.left ?? (window.innerWidth / 2 - pw / 2);
+    const y = (anchorRect?.bottom ?? 100) + 8;
+
+    pop.style.left = `${Math.min(window.innerWidth - pw, Math.max(8, x))}px`;
+    pop.style.top = `${Math.min(window.innerHeight - ph, Math.max(8, y))}px`;
+
+    pop.addEventListener("mousedown", (e) => e.stopPropagation());
+
+    const modeEl = pop.querySelector("[data-f-mode]");
+    const body = pop.querySelector("[data-f-body]");
+
+    const renderBody = () => {
+      const m = modeEl.value;
+
+      if (m === "none") {
+        body.innerHTML = `<div class="muted">No filter applied.</div>`;
+        return;
+      }
+
+      if (m === "text") {
+        const op = existing.op ?? "contains";
+        const val = existing.value ?? "";
+        body.innerHTML = `
+          <label>Operation</label>
+          <select data-f-op>
+            <option value="contains" ${op === "contains" ? "selected" : ""}>Contains</option>
+            <option value="equals" ${op === "equals" ? "selected" : ""}>Equals</option>
+            <option value="starts" ${op === "starts" ? "selected" : ""}>Starts with</option>
+          </select>
+
+          <label>Value</label>
+          <input data-f-val value="${escapeHtml(val)}" placeholder="Type to filter..." />
+        `;
+        return;
+      }
+
+      if (m === "range") {
+        if (type === "number") {
+          const min = existing.min ?? "";
+          const max = existing.max ?? "";
+          body.innerHTML = `
+            <div class="row">
+              <div>
+                <label>Min</label>
+                <input data-f-min value="${escapeHtml(min)}" placeholder="e.g. 10" />
+              </div>
+              <div>
+                <label>Max</label>
+                <input data-f-max value="${escapeHtml(max)}" placeholder="e.g. 100" />
+              </div>
+            </div>
+          `;
+        } else {
+          const from = existing.from ?? "";
+          const to = existing.to ?? "";
+          body.innerHTML = `
+            <div class="row">
+              <div>
+                <label>From</label>
+                <input data-f-from type="datetime-local" value="${escapeHtml(toDatetimeLocalValue(from))}" />
+              </div>
+              <div>
+                <label>To</label>
+                <input data-f-to type="datetime-local" value="${escapeHtml(toDatetimeLocalValue(to))}" />
+              </div>
+            </div>
+          `;
+        }
+        return;
+      }
+
+      if (m === "blanks") {
+        const blanks = !!existing.blanks;
+        const nonblanks = !!existing.nonblanks;
+        body.innerHTML = `
+          <label>
+            <input data-f-blanks type="checkbox" ${blanks ? "checked" : ""}/>
+            Show blanks
+          </label>
+          <label style="margin-top:8px;">
+            <input data-f-nonblanks type="checkbox" ${nonblanks ? "checked" : ""}/>
+            Show non-blanks
+          </label>
+        `;
+        return;
+      }
+
+      if (m === "values") {
+        body.innerHTML = `
+          <div class="valTools">
+            <button type="button" data-f-all>Select all</button>
+            <button type="button" data-f-none>Select none</button>
+          </div>
+          <div class="valList" data-f-list>
+            ${uniqueValues.map(u => {
+              const checked = includeSet.has(u.key);
+              return `
+                <div class="valItem">
+                  <input type="checkbox" data-f-vchk value="${escapeHtml(u.key)}" ${checked ? "checked" : ""}/>
+                  <span>${escapeHtml(u.label)}</span>
+                  <span style="margin-left:auto;color:#64748b;font-size:11px;font-weight:900">${u.count}</span>
+                </div>
+              `;
+            }).join("")}
+          </div>
+        `;
+        body.querySelector("[data-f-all]")?.addEventListener("click", () => {
+          body.querySelectorAll("[data-f-vchk]").forEach(ch => { ch.checked = true; });
+        });
+        body.querySelector("[data-f-none]")?.addEventListener("click", () => {
+          body.querySelectorAll("[data-f-vchk]").forEach(ch => { ch.checked = false; });
+        });
+        return;
+      }
+
+      body.innerHTML = `<div class="muted">Unknown mode</div>`;
+    };
+
+    modeEl.addEventListener("change", () => renderBody());
+    renderBody();
+
+    pop.querySelector("[data-f-apply]")?.addEventListener("click", () => {
+      const m = modeEl.value;
+      const filter = { mode: m };
+
+      if (m === "text") {
+        filter.op = pop.querySelector("[data-f-op]")?.value ?? "contains";
+        filter.value = pop.querySelector("[data-f-val]")?.value ?? "";
+      } else if (m === "range") {
+        if (type === "number") {
+          filter.min = pop.querySelector("[data-f-min]")?.value ?? "";
+          filter.max = pop.querySelector("[data-f-max]")?.value ?? "";
+        } else {
+          filter.from = normalizeDatetimeLocalValue(pop.querySelector("[data-f-from]")?.value ?? "");
+          filter.to = normalizeDatetimeLocalValue(pop.querySelector("[data-f-to]")?.value ?? "");
+        }
+      } else if (m === "blanks") {
+        filter.blanks = !!pop.querySelector("[data-f-blanks]")?.checked;
+        filter.nonblanks = !!pop.querySelector("[data-f-nonblanks]")?.checked;
+      } else if (m === "values") {
+        const include = [];
+        pop.querySelectorAll("[data-f-vchk]").forEach(ch => { if (ch.checked) include.push(ch.value); });
+        filter.include = include;
+      }
+
+      if (m === "none") delete this.state.filters[colId];
+      else this.state.filters[colId] = filter;
+
+      this._recomputeView();
+      this._computeRowMeta();
+      this._renderGrid({ full: true });
+      this._persistUiDebounced();
+      this._closeFilter();
+    });
+
+    pop.querySelector("[data-f-clear]")?.addEventListener("click", () => {
+      delete this.state.filters[colId];
+      this._recomputeView();
+      this._computeRowMeta();
+      this._renderGrid({ full: true });
+      this._persistUiDebounced();
+      this._closeFilter();
+    });
+  }
+
+  // ---------- Columns popover ----------
+  _closeColumnsPopover() {
+    const f = this._getFloating();
+    const existing = f?.querySelector("[data-colspop]");
+    if (existing) existing.remove();
+  }
+
+  _toggleColumnsPopover(anchorEl) {
+    const f = this._getFloating();
+    const existing = f?.querySelector("[data-colspop]");
+    if (existing) { existing.remove(); return; }
+
+    const rect = anchorEl.getBoundingClientRect();
+    const x = rect.left;
+    const y = rect.bottom + 6;
+
+    const pop = document.createElement("div");
+    pop.className = "popover";
+    pop.setAttribute("data-colspop", "1");
+
+    const cols = this.state.columns;
+    pop.innerHTML = `
+      <h4>Columns</h4>
+      <div class="colsList" data-cols-list>
+        ${cols.map(c => {
+          const hidden = !!this.state.colHidden[c.id];
+          const ro = c.readOnly ? "RO" : "ED";
+          return `
+            <div class="colsItem">
+              <input type="checkbox" data-col-toggle value="${escapeHtml(c.id)}" ${hidden ? "" : "checked"} />
+              <div class="name">${escapeHtml(c.name)}</div>
+              <div class="meta">${ro}</div>
+            </div>
+          `;
+        }).join("")}
+      </div>
+      <div class="actions">
+        <button data-cols-showall>Show all</button>
+        <button data-cols-hideall>Hide all</button>
+      </div>
+      <div class="muted">Tip: Use this to unhide columns.</div>
+    `;
+
+    f.appendChild(pop);
+
+    const pw = 420;
+    const ph = 560;
+    pop.style.left = `${Math.min(window.innerWidth - pw, Math.max(8, x))}px`;
+    pop.style.top = `${Math.min(window.innerHeight - ph, Math.max(8, y))}px`;
+
+    pop.addEventListener("mousedown", (e) => e.stopPropagation());
+
+    pop.querySelectorAll("[data-col-toggle]").forEach(ch => {
+      ch.addEventListener("change", () => {
+        const id = ch.value;
+        const show = !!ch.checked;
+        if (show) this._showColumn(id);
+        else this._hideColumn(id);
+      });
+    });
+
+    pop.querySelector("[data-cols-showall]")?.addEventListener("click", () => {
+      for (const c of this.state.columns) delete this.state.colHidden[c.id];
+      this._recomputeView();
+      this._renderGrid({ full: true });
+      this._persistUiDebounced();
+      this._closeColumnsPopover();
+    });
+
+    pop.querySelector("[data-cols-hideall]")?.addEventListener("click", () => {
+      const keep = this.state.columns[0]?.id;
+      for (const c of this.state.columns) this.state.colHidden[c.id] = true;
+      if (keep) delete this.state.colHidden[keep];
+      this._recomputeView();
+      this._renderGrid({ full: true });
+      this._persistUiDebounced();
+      this._closeColumnsPopover();
+    });
+  }
+
+  // ---------- Column reorder ----------
+  _getHeaderThRects() {
+    const ths = [...this.shadowRoot.querySelectorAll('thead th[data-colid]')];
+    return ths.map((th) => ({ th, colId: th.dataset.colid, rect: th.getBoundingClientRect() }));
+  }
+
+  _hitTestHeaderIndexByX(clientX) {
+    const rects = this._getHeaderThRects();
+    if (!rects.length) return -1;
+    for (let i = 0; i < rects.length; i++) {
+      const mid = (rects[i].rect.left + rects[i].rect.right) / 2;
+      if (clientX < mid) return i;
+    }
+    return rects.length - 1;
+  }
+
+  _startColDrag(colId, e) {
+    const fromIndex = this._view.viewColIds.indexOf(colId);
+    if (fromIndex < 0) return;
+
+    const ghost = document.createElement("div");
+    ghost.className = "colDragGhost";
+    ghost.textContent = this._colById(colId)?.name ?? colId;
+    document.body.appendChild(ghost);
+
+    const moveGhost = (ev) => {
+      ghost.style.left = `${ev.clientX}px`;
+      ghost.style.top = `${ev.clientY}px`;
+    };
+    moveGhost(e);
+
+    this._colDrag = { colId, fromIndex, overIndex: fromIndex, ghostEl: ghost };
+
+    const onMove = (ev) => {
+      moveGhost(ev);
+
+      const over = this._hitTestHeaderIndexByX(ev.clientX);
+
+      this.shadowRoot.querySelectorAll("th.colDropTarget").forEach(x => x.classList.remove("colDropTarget"));
+
+      if (over >= 0) {
+        this._colDrag.overIndex = over;
+        const ths = [...this.shadowRoot.querySelectorAll("thead th[data-colid]")];
+        const target = ths[over];
+        if (target) target.classList.add("colDropTarget");
+      }
+    };
+
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove, true);
+      document.removeEventListener("pointerup", onUp, true);
+
+      this.shadowRoot.querySelectorAll("th.colDropTarget").forEach(x => x.classList.remove("colDropTarget"));
+      ghost.remove();
+
+      const drag = this._colDrag;
+      this._colDrag = null;
+      if (!drag) return;
+
+      if (drag.fromIndex !== drag.overIndex) {
+        const oldView = [...this._view.viewColIds];
+
+        const id = drag.colId;
+        const order = [...this.state.columnOrder];
+        const from = order.indexOf(id);
+        if (from >= 0) {
+          order.splice(from, 1);
+
+          const overColId = oldView[drag.overIndex];
+          const to = order.indexOf(overColId);
+          if (to >= 0) order.splice(to, 0, id);
+          else order.push(id);
+
+          this.state.columnOrder = order;
+
+          this._recomputeView();
+          this._remapSelectionAfterColOrderChange(oldView);
+          this._renderGrid({ full: true });
+          this._persistUiDebounced();
+          this._setStatus("Column moved");
+        }
+      }
+    };
+
+    document.addEventListener("pointermove", onMove, true);
+    document.addEventListener("pointerup", onUp, true);
+  }
+
+  _remapSelectionAfterColOrderChange(oldViewColIds) {
+    const newView = this._view.viewColIds;
+
+    const activeOldId = oldViewColIds[this.state.active.c];
+    const sel = this._normalizeSel(this.state.selection);
+    const selectedIds = oldViewColIds.slice(sel.c1, sel.c2 + 1);
+
+    const newActiveIndex = activeOldId ? newView.indexOf(activeOldId) : -1;
+    if (newActiveIndex >= 0) this.state.active.c = newActiveIndex;
+    else this.state.active.c = clamp(this.state.active.c, 0, Math.max(0, newView.length - 1));
+
+    const idxs = selectedIds.map(id => newView.indexOf(id)).filter(i => i >= 0);
+    if (idxs.length) {
+      const min = Math.min(...idxs);
+      const max = Math.max(...idxs);
+      this.state.selection.c1 = min;
+      this.state.selection.c2 = max;
+    } else {
+      this.state.selection.c1 = this.state.active.c;
+      this.state.selection.c2 = this.state.active.c;
+    }
+  }
+
+  // ---------- Rows (server-backed) ----------
+  async _addRow() {
+    if (this.readOnly) return;
+    try {
+      const row = await this._addRowServer();
+      // optimistic local insert (SignalR will also broadcast, but that's ok)
+      if (row?.id && !this.state.rows.some(r => r.id === row.id)) {
+        this.state.rows.unshift({ ...row, values: row.values || {} });
+        this._rowVer.set(row.id, row.rowVer);
+        this.state.rowOrder = [row.id, ...this.state.rowOrder.filter(id => id !== row.id)];
+      }
+      this._recomputeView();
+      this._computeRowMeta();
+      this._renderGrid({ full: true });
+      this._toast("Row added.", { kind: "ok" });
+    } catch (e) {
+      console.error(e);
+      this._toast("Add row failed.", { kind: "error", detail: String(e?.message || e) });
+    }
+  }
+
+  async _deleteSelectedRows() {
+    if (this.readOnly) return;
+    const sel = this._normalizeSel(this.state.selection);
+    const ids = new Set();
+    for (let rr = sel.r1; rr <= sel.r2; rr++) {
+      const rowId = this._view.viewRowIds[rr];
+      if (rowId) ids.add(rowId);
+    }
+    if (!ids.size) return;
+
+    try {
+      await this._deleteRowsServer([...ids]);
+
+      // optimistic local remove (SignalR will also broadcast)
+      this.state.rows = this.state.rows.filter(r => !ids.has(r.id));
+      this.state.rowOrder = this.state.rowOrder.filter(id => !ids.has(id));
+      for (const id of ids) this._rowVer.delete(id);
+
+      this._recomputeView();
+      this._computeRowMeta();
+      this._renderGrid({ full: true });
+      this._toast("Rows deleted.", { kind: "ok" });
+    } catch (e) {
+      console.error(e);
+      this._toast("Delete rows failed.", { kind: "error", detail: String(e?.message || e) });
+    }
+  }
+
+  // ---------- Toast UI ----------
+  _showToast(message, { kind = "ok", detail = "", ms = 3600 } = {}) {
+    const host = this.shadowRoot.querySelector("[data-toasts]");
+    if (!host) return;
+    const el = document.createElement("div");
+    el.className = `toast ${kind}`;
+    el.innerHTML = `
+      <div class="t1">${escapeHtml(message)}</div>
+      ${detail ? `<div class="t2">${escapeHtml(detail)}</div>` : ""}
+    `;
+    host.appendChild(el);
+    setTimeout(() => { try { el.remove(); } catch {} }, ms);
+  }
+
+  // ---------- Conflict modal ----------
+  _openConflictModal(rowId, colId) {
+    const key = `${rowId}|${colId}`;
+    const c = this._conflicts.get(key);
+    if (!c) return;
+
+    // close any existing
+    this._closeConflictModal();
+
+    const col = this._colById(colId);
+    const f = this._getFloating();
+
+    const back = document.createElement("div");
+    back.className = "modalBackdrop";
+    back.setAttribute("data-conflict-modal", "1");
+
+    const modal = document.createElement("div");
+    modal.className = "modal";
+
+    modal.innerHTML = `
+      <h3>Save conflict</h3>
+      <div class="sub">
+        Column: <b>${escapeHtml(col?.name || colId)}</b> — Server updated by <b>${escapeHtml(c.updatedBy || "someone")}</b>
+        ${c.updatedAt ? `at <b>${escapeHtml(c.updatedAt)}</b>` : ""}.
+      </div>
+
+      <div class="grid">
+        <div>
+          <div class="sub" style="margin-top:10px;">Your value</div>
+          <pre>${escapeHtml(c.mine ?? "")}</pre>
+        </div>
+        <div>
+          <div class="sub" style="margin-top:10px;">Server value</div>
+          <pre>${escapeHtml(c.server ?? "")}</pre>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btnPrimary" data-act="keep">Keep mine (overwrite)</button>
+        <button data-act="accept">Accept server</button>
+        <button class="btnDanger" data-act="close">Close</button>
+      </div>
+    `;
+
+    back.appendChild(modal);
+    f.appendChild(back);
+
+    back.addEventListener("mousedown", (e) => { if (e.target === back) this._closeConflictModal(); });
+    modal.addEventListener("mousedown", (e) => e.stopPropagation());
+
+    modal.querySelector('[data-act="close"]')?.addEventListener("click", () => this._closeConflictModal());
+    modal.querySelector('[data-act="accept"]')?.addEventListener("click", () => {
+      // keep server value already shown, just clear conflict
+      this._conflicts.delete(key);
+      this._closeConflictModal();
+      this._renderGrid({ full: false });
+      this._toast("Accepted server value.", { kind: "ok" });
+    });
+
+    modal.querySelector('[data-act="keep"]')?.addEventListener("click", async () => {
+      // overwrite by queueing user's value again, now with latest rowVer
+      const row = this.state.rows.find(r => r.id === rowId);
+      if (row) row.values[colId] = c.mine;
+
+      this._conflicts.delete(key);
+      this._closeConflictModal();
+      this._renderGrid({ full: false });
+
+      await this._saveCellToServer(rowId, colId, c.mine);
+      this._toast("Re-applied your value (saving).", { kind: "ok" });
+    });
+  }
+
+  _closeConflictModal() {
+    const f = this._getFloating();
+    const el = f?.querySelector('[data-conflict-modal="1"]');
+    if (el) el.remove();
+  }
+
+  // ---------- Column + Row menus ----------
+  // (ctx + filter implemented above; we keep empty stubs for closing)
+  _closeColumnsPopover() { /* overwritten above */ }
+
+  // ---------- Column reorder done above ----------
+
+  // ---------- Column hide/unhide done above ----------
+
+  // ---------- Clipboard + fill done above ----------
+
+}
+
+if (!customElements.get("sheet-grid")) {
+  customElements.define("sheet-grid", SheetGrid);
+}

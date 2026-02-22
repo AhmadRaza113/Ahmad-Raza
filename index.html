@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Auditor Request Tracker - Grid</title>
+  <style>
+    :root{
+      --bg:#f1f5f9;
+      --card:#ffffff;
+      --text:#0f172a;
+      --muted:#64748b;
+      --line:#e2e8f0;
+      --primary:#2563eb;
+    }
+    body{ margin:0; padding:24px; font-family:Segoe UI, Arial, sans-serif; background:var(--bg); color:var(--text); }
+    .card{ max-width:1600px; margin:0 auto; background:var(--card); border:1px solid var(--line); border-radius:14px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,.06); }
+    .head{ padding:16px 18px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; background:linear-gradient(180deg,#ffffff,#f8fafc); }
+    .logo{ width:34px; height:34px; border-radius:10px; background:rgba(37,99,235,.12); display:flex; align-items:center; justify-content:center; font-weight:900; color:var(--primary); }
+    .titles{ display:flex; flex-direction:column; gap:2px; }
+    .titles .t1{ font-weight:900; font-size:14px; letter-spacing:.2px; }
+    .titles .t2{ font-size:12px; color:var(--muted); font-weight:700; }
+    .right{ margin-left:auto; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .pill{ font-size:12px; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:#fff; font-weight:800; }
+    .pill.good{ border-color: rgba(34,197,94,.25); background: rgba(34,197,94,.08); color:#166534; }
+    .pill.bad{ border-color: rgba(239,68,68,.25); background: rgba(239,68,68,.08); color:#991b1b; }
+    .row{ padding:14px 18px; }
+    a{ color:var(--primary); text-decoration:none; font-weight:800; }
+    .hint{ font-size:12px; color:var(--muted); margin-left:8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="head">
+      <div class="logo">AR</div>
+      <div class="titles">
+        <div class="t1">Auditor Request Tracker</div>
+        <div class="t2">Grid View (parallel editing + cell locks)</div>
+      </div>
+      <div class="right">
+        <span class="pill" id="pillClient">Client: —</span>
+        <span class="pill" id="pillUser">User: —</span>
+        <span class="pill" id="pillConn">Live: —</span>
+      </div>
+    </div>
+
+    <div class="row">
+      <sheet-grid id="grid"></sheet-grid>
+      <div class="hint">
+        Tip: open this page in two browser windows with different <b>?user=</b> to test parallel edits.
+        Example: <a href="?client=1&user=ali@live">?client=1&user=ali@live</a>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    const qs = new URLSearchParams(location.search);
+
+    const clientId = Number(qs.get("client") || 1);
+    const userId = (qs.get("user")
+      || localStorage.getItem("auditorGridUserId")
+      || ("user" + Math.floor(Math.random()*9000+1000) + "@web")
+    ).trim();
+
+    localStorage.setItem("auditorGridUserId", userId);
+
+    // IMPORTANT:
+    // sheet-grid.js is currently calling: `${apiBase}/api/<endpoint>`
+    // so api-base MUST be the Function App ROOT (NO /api).
+    const normalizeApiRoot = (u) => {
+      u = String(u || "").trim().replace(/\/+$/, "");
+      // If user passes .../api, strip it to avoid .../api/api/...
+      u = u.replace(/\/api$/i, "");
+      return u;
+    };
+
+    // You can pass:
+    // ?api=https://<app>.azurewebsites.net
+    // OR even if you pass /api, we will strip it safely.
+    const apiRoot = normalizeApiRoot(
+      qs.get("api") || "https://sql-nitto-auditor-request-e4hjduh8ang7btdk.canadacentral-01.azurewebsites.net"
+    );
+
+    // Ensure SignalR is available BEFORE importing the component
+    async function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = src;
+        s.async = true;
+        s.onload = () => resolve(true);
+        s.onerror = () => reject(new Error("Failed to load " + src));
+        document.head.appendChild(s);
+      });
+    }
+
+    async function ensureSignalR() {
+      if (window.signalR) return true;
+
+      const cdns = [
+        "https://cdn.jsdelivr.net/npm/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js",
+        "https://unpkg.com/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js",
+      ];
+
+      for (const src of cdns) {
+        try {
+          await loadScript(src);
+          if (window.signalR) return true;
+        } catch (_) { /* try next */ }
+      }
+      return !!window.signalR;
+    }
+
+    const grid = document.getElementById("grid");
+
+    // ✅ Set required attributes BEFORE defining/importing the web component
+    grid.setAttribute("api-base", apiRoot);
+    grid.setAttribute("client-id", String(clientId));
+    grid.setAttribute("user-id", userId);
+    grid.setAttribute("storage-key", `auditor-grid-ui-client-${clientId}`);
+
+    document.getElementById("pillClient").textContent = `Client: ${clientId}`;
+    document.getElementById("pillUser").textContent = `User: ${userId}`;
+
+    const pillConn = document.getElementById("pillConn");
+    grid.addEventListener("live", (e) => {
+      const { connected } = e.detail || {};
+      pillConn.textContent = connected ? "Live: Connected" : "Live: Disconnected";
+      pillConn.className = connected ? "pill good" : "pill bad";
+    });
+
+    grid.addEventListener("toast", (e) => console.log("TOAST:", e.detail));
+
+    // Load SignalR (fallback) then load the component
+    await ensureSignalR();
+    await import("./sheet-grid.js");
+  </script>
+</body>
+</html>

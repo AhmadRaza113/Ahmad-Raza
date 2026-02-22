@@ -1,0 +1,346 @@
+{
+  "schemaVersion": "1.1.0",
+  "description": "Maps features/capabilities to docs and code for AI routing. Uses current live root paths as canonical.",
+  "status": "starter-updated",
+  "lastVerified": "2026-02-22",
+  "features": {
+    "grid.public-api-hosting": {
+      "area": "grid",
+      "status": "active",
+      "description": "Public custom element usage, attributes, host events, and host initialization behavior.",
+      "docs": [
+        "docs/grid/public-api.md",
+        "docs/integration/grid-portal-contract.md",
+        "docs/00-project-overview.md"
+      ],
+      "code": [
+        "index.html",
+        "sheet-grid.js",
+        "src/component.js"
+      ],
+      "knownFacts": {
+        "attributes": [
+          "api-base (required)",
+          "client-id (required)",
+          "user-id (required)",
+          "storage-key (optional)",
+          "readonly (optional boolean)"
+        ],
+        "events": [
+          "live",
+          "toast"
+        ]
+      }
+    },
+    "grid.boot-sequence": {
+      "area": "grid",
+      "status": "active",
+      "description": "Grid startup lifecycle: preferences → data fetch → normalize → render → SignalR connect.",
+      "docs": [
+        "docs/grid/boot-sequence.md",
+        "docs/grid/state-persistence.md",
+        "docs/grid/module-map.md"
+      ],
+      "code": [
+        "sheet-grid.js",
+        "src/component.js",
+        "src/state/persistence.js",
+        "src/api/client.js",
+        "src/live/connection.js"
+      ]
+    },
+    "grid.inline-editing": {
+      "area": "grid",
+      "status": "active",
+      "description": "Cell inline editor lifecycle and commit/cancel behavior.",
+      "docs": [
+        "docs/grid/selection-editing-interaction-model.md",
+        "docs/grid/data-contracts.md",
+        "docs/grid/module-map.md"
+      ],
+      "code": [
+        "src/editing/inline-editor.js",
+        "src/rendering/cell.js",
+        "src/actions/selection.js",
+        "src/interaction/mouse.js",
+        "src/interaction/keyboard.js"
+      ],
+      "relatedFeatures": [
+        "grid.selection-navigation",
+        "grid.cell-locking",
+        "grid.live-typing-preview",
+        "grid.conflict-resolution"
+      ]
+    },
+    "grid.selection-navigation": {
+      "area": "grid",
+      "status": "active",
+      "description": "Excel-like active cell/selection movement and selection UI behavior.",
+      "docs": [
+        "docs/grid/selection-editing-interaction-model.md",
+        "docs/grid/rendering-and-virtualization.md"
+      ],
+      "code": [
+        "src/actions/selection.js",
+        "src/interaction/mouse.js",
+        "src/interaction/keyboard.js",
+        "src/rendering/selection-ui.js"
+      ]
+    },
+    "grid.clipboard": {
+      "area": "grid",
+      "status": "active",
+      "description": "Clipboard copy/cut/paste TSV handling.",
+      "docs": [
+        "docs/grid/selection-editing-interaction-model.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "code": [
+        "src/editing/clipboard.js",
+        "src/utils/tsv.js",
+        "src/actions/selection.js"
+      ]
+    },
+    "grid.fill-handle": {
+      "area": "grid",
+      "status": "active",
+      "description": "Drag-to-fill spreadsheet behavior.",
+      "docs": [
+        "docs/grid/selection-editing-interaction-model.md"
+      ],
+      "code": [
+        "src/interaction/fill-handle.js",
+        "src/actions/selection.js",
+        "src/editing/clipboard.js"
+      ]
+    },
+    "grid.columns-layout": {
+      "area": "grid",
+      "status": "active",
+      "description": "Column reorder/resize/visibility and related persistence.",
+      "docs": [
+        "docs/grid/state-persistence.md",
+        "docs/grid/data-contracts.md",
+        "docs/grid/module-map.md"
+      ],
+      "code": [
+        "src/interaction/column-drag.js",
+        "src/actions/column-actions.js",
+        "src/ui/columns-popover.js",
+        "src/config/columns.js",
+        "src/state/persistence.js"
+      ]
+    },
+    "grid.filters-sorting": {
+      "area": "grid",
+      "status": "active",
+      "description": "Filtering and sorting behavior, including default sort behavior.",
+      "docs": [
+        "docs/grid/state-persistence.md",
+        "docs/grid/data-contracts.md",
+        "docs/grid/module-map.md"
+      ],
+      "code": [
+        "src/actions/sorting.js",
+        "src/ui/filter-popover.js",
+        "src/state/view.js",
+        "src/config/defaults.js"
+      ],
+      "knownBehaviors": [
+        "Default sort by seqNum (backend/invisible column) is expected in current implementation"
+      ]
+    },
+    "grid.virtualization": {
+      "area": "grid",
+      "status": "active",
+      "description": "Virtual scrolling and variable-height row rendering.",
+      "docs": [
+        "docs/grid/rendering-and-virtualization.md",
+        "docs/grid/known-limitations.md"
+      ],
+      "code": [
+        "src/virtualization/virtual-scroll.js",
+        "src/rendering/grid.js",
+        "src/rendering/body.js",
+        "src/rendering/selection-ui.js"
+      ]
+    },
+    "grid.cell-locking": {
+      "area": "grid",
+      "status": "active",
+      "description": "Redis-backed cell lock acquire/renew/release plus lock visual state.",
+      "docs": [
+        "docs/grid/collaboration-model.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "code": [
+        "src/api/locks-api.js",
+        "src/live/handlers.js",
+        "src/rendering/cell.js",
+        "src/editing/inline-editor.js"
+      ],
+      "backendContracts": {
+        "endpoints": [
+          "POST /api/locks/acquire",
+          "POST /api/locks/renew",
+          "POST /api/locks/release"
+        ],
+        "payloadNotes": [
+          "acquire/renew include clientId,rowId,colId,userId,ttlSeconds",
+          "holder object may be returned when not acquired/renewed"
+        ]
+      },
+      "knownBehaviors": [
+        "TTL ~30s",
+        "Renew heartbeat ~12s",
+        "Visual lock indicator shown when another user holds cell"
+      ]
+    },
+    "grid.live-typing-preview": {
+      "area": "grid",
+      "status": "active",
+      "description": "Typing preview broadcast and display with typist identity.",
+      "docs": [
+        "docs/grid/collaboration-model.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "code": [
+        "src/api/typing-api.js",
+        "src/live/handlers.js",
+        "src/live/connection.js",
+        "src/rendering/cell.js"
+      ],
+      "backendContracts": {
+        "endpoint": "POST /api/typing",
+        "signalrEvent": "gridTyping"
+      },
+      "knownBehaviors": [
+        "Typing value '' clears preview",
+        "Typist name shown in grid UI badge/indicator"
+      ]
+    },
+    "grid.conflict-resolution": {
+      "area": "grid",
+      "status": "active",
+      "description": "Conflict detection and resolution on stale baseRowVer.",
+      "docs": [
+        "docs/grid/collaboration-model.md",
+        "docs/grid/data-contracts.md"
+      ],
+      "code": [
+        "src/api/cells-api.js",
+        "src/live/handlers.js",
+        "src/ui/conflict-modal.js",
+        "src/state/normalize.js"
+      ],
+      "backendContracts": {
+        "endpoint": "POST /api/auditorRequests/batch",
+        "conflictMarker": "results[].conflict === true"
+      },
+      "knownBehaviors": [
+        "Conflict modal offers Keep Mine / Accept Server flow"
+      ]
+    },
+    "grid.live-save-propagation": {
+      "area": "grid",
+      "status": "active",
+      "description": "Saved values propagate live to other users via SignalR without refresh.",
+      "docs": [
+        "docs/grid/collaboration-model.md",
+        "docs/grid/boot-sequence.md"
+      ],
+      "code": [
+        "src/live/handlers.js",
+        "src/live/connection.js",
+        "src/api/cells-api.js",
+        "src/state/view.js"
+      ],
+      "signalrEvent": "gridPatch",
+      "knownBehaviors": [
+        "Recent fix addressed debounce race + DB-fetch fallback timing"
+      ]
+    },
+    "grid.rows-add-delete-live": {
+      "area": "grid",
+      "status": "active",
+      "description": "Add/delete rows and receive corresponding live events.",
+      "docs": [
+        "docs/grid/data-contracts.md",
+        "docs/grid/collaboration-model.md"
+      ],
+      "code": [
+        "src/api/rows-api.js",
+        "src/live/handlers.js",
+        "src/state/normalize.js",
+        "src/state/view.js"
+      ],
+      "backendContracts": {
+        "endpoints": [
+          "POST /api/auditorRequests/rows",
+          "POST /api/auditorRequests/rows/delete"
+        ],
+        "signalrEvents": [
+          "gridRowAdded",
+          "gridRowsDeleted"
+        ]
+      }
+    },
+    "grid.backend-load-and-batch-save": {
+      "area": "backend-grid-contract",
+      "status": "active",
+      "description": "Primary load and batch save REST contracts used by the grid.",
+      "docs": [
+        "docs/grid/data-contracts.md",
+        "services/auditor-grid-api/docs/rows-cells-locks-contracts.md"
+      ],
+      "code": [
+        "src/api/client.js",
+        "src/api/cells-api.js",
+        "src/state/normalize.js"
+      ],
+      "backendContracts": {
+        "load": "GET /api/auditorRequests?clientId={n}[&rowId={id}]",
+        "batchSave": "POST /api/auditorRequests/batch"
+      },
+      "knownFields": [
+        "row.id",
+        "row.clientId",
+        "row.reqNo",
+        "row.seqNum",
+        "row.rowVer",
+        "row.updatedAt",
+        "row.updatedBy",
+        "row.values.*"
+      ]
+    },
+    "portal.poc-single-file-summary": {
+      "area": "portal",
+      "status": "poc-external-summary",
+      "description": "Portal exists as prior single-file POC summary, but no live portal code exists in current repo app folder.",
+      "docs": [
+        "docs/portal/overview.md",
+        "docs/portal/poc-to-modular-migration-plan.md"
+      ],
+      "code": [
+        "apps/portal/index.html"
+      ],
+      "notes": [
+        "apps/portal scaffold is currently empty; treat portal as planned work."
+      ]
+    },
+    "integration.portal-grid-embedding": {
+      "area": "integration",
+      "status": "planned",
+      "description": "Future portal embeds grid and passes current public attributes plus host listeners.",
+      "docs": [
+        "docs/integration/grid-portal-contract.md",
+        "docs/grid/public-api.md"
+      ],
+      "code": [
+        "index.html",
+        "src/component.js",
+        "apps/portal/src/screens/"
+      ]
+    }
+  }
+}
