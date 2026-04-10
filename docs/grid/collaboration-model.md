@@ -15,7 +15,7 @@ This document describes the real-time collaborative behavior of the grid compone
 
 > **Note:** At the time this document was written, the source files listed under "Must inspect" were not present in the repository. All behavioral details below are marked **Needs verification** until the corresponding source code is reviewed. Once those files are available, this document should be updated using the source-of-truth priority order:
 > 1. Actual code in repo
-> 2. `docs/grid/_code-verified-notes.md`
+> 2. [`docs/grid/_code-verified-notes.md`](./_code-verified-notes.md) — fill this in as you verify each item
 > 3. Existing docs (only if code-aligned)
 > 4. Unknowns → _Needs verification_
 
@@ -267,15 +267,15 @@ The following items require inspection of the actual source code before this doc
 | 11 | Whether `src/ui/toasts.js` is used for connection/conflict UX | `src/ui/toasts.js` |
 | 12 | How `gridPatch` received during an active edit session is handled | `src/live/handlers.js`, `src/editing/inline-editor.js` |
 | 13 | Whether lock auto-expiry triggers a `gridLockChanged` event to peers | Backend hub / `src/live/handlers.js` |
-| 14 | All items in `docs/grid/_code-verified-notes.md` (file not yet present) | `docs/grid/_code-verified-notes.md` |
+| 14 | All items in [`docs/grid/_code-verified-notes.md`](./_code-verified-notes.md) | `docs/grid/_code-verified-notes.md` |
 
 ---
 
 ## Related Docs
 
-- `docs/grid/_code-verified-notes.md` — code-verified implementation notes (not yet present in repo)
+- [`docs/grid/_code-verified-notes.md`](./_code-verified-notes.md) — structured template for recording code-verified facts; fill in as source files are reviewed
 - `README.md` — project overview
 
 ---
 
-_Last updated: 2026-02-22. This document was authored before the referenced source files were present in the repository; all behavioral claims require code verification._
+_Last updated: 2026-04-10. Source files are not yet present in the repository; all behavioral claims require code verification. Record verified facts in [`_code-verified-notes.md`](./_code-verified-notes.md)._
